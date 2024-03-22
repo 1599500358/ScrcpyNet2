@@ -1,0 +1,50 @@
+﻿<rxui:ReactiveUserControl x:TypeArguments="vm:ScrcpyViewModel"  x:Class="ScrcpyNet.Sample.Wpf.ScrcpyItem"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:rxui="http://reactiveui.net"
+        xmlns:s="clr-namespace:System;assembly=mscorlib"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:ScrcpyNet.Sample.Wpf"
+        xmlns:vm="clr-namespace:ScrcpyNet.Sample.ViewModels;assembly=ScrcpyNet.Sample.ViewModels"
+        xmlns:scrcpy="clr-namespace:ScrcpyNet;assembly=ScrcpyNet"
+        xmlns:scrcpyWpf="clr-namespace:ScrcpyNet.Wpf;assembly=ScrcpyNet.Wpf"
+        mc:Ignorable="d"
+             Background="#eee"
+         Height="386" Width="610">
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="20"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="25"/>
+        </Grid.RowDefinitions>
+        <TextBlock Text="{Binding DeviceName}" Grid.Row="0" Margin="8,4,0,0"/>
+        <StackPanel Grid.Row="2">
+            <DockPanel>
+                <WrapPanel >
+                    <WrapPanel.Resources>
+                        <Style TargetType="Button">
+                            <Setter Property="Command" Value="{Binding SendKeycodeCommand}"/>
+                        </Style>
+                    </WrapPanel.Resources>
+                    <Button Content="connect" Command="{Binding ConnectCommand}" Margin="4"/>
+                    <Button Content="disconnect" Command="{Binding DisconnectCommand}" Margin="4"/>
+                    <Button Content="Back" Margin="4" CommandParameter="{x:Static scrcpy:AndroidKeycode.AKEYCODE_BACK}"/>
+                    <Button Content="Home" Margin="4" CommandParameter="{x:Static scrcpy:AndroidKeycode.AKEYCODE_HOME}"/>
+                    <Button Content="Tasks" Margin="4" CommandParameter="{x:Static scrcpy:AndroidKeycode.AKEYCODE_APP_SWITCH}"/>
+
+                    <!-- TODO: I don't know what message to send to lock the screen. -->
+                    <!--<Button Content="Lock"/>-->
+
+                    <Button Content="Vol +" Margin="4" CommandParameter="{x:Static scrcpy:AndroidKeycode.AKEYCODE_VOLUME_UP}"/>
+                    <Button Content="Vol -" Margin="4" CommandParameter="{x:Static scrcpy:AndroidKeycode.AKEYCODE_VOLUME_DOWN}"/>
+                </WrapPanel>
+            </DockPanel>
+        </StackPanel>
+        <scrcpyWpf:ScrcpyDisplay Scrcpy="{Binding Scrcpy}" Grid.Row="1"/>
+    </Grid>
+</rxui:ReactiveUserControl>
