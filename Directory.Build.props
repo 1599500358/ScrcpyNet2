@@ -4,7 +4,7 @@
         <Authors>Fusion86</Authors>
         <Company>Fusion86</Company>
         <Deterministic>true</Deterministic>
-        <LangVersion>8.0</LangVersion>
+        <LangVersion>latest</LangVersion>
         <Nullable>enable</Nullable>
 
         <!-- Packages should include ../build/Package.props which overrides this property. -->

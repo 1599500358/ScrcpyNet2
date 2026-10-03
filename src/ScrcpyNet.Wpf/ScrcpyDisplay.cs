@@ -47,7 +47,36 @@ namespace ScrcpyNet.Wpf
             typeof(Scrcpy),
             typeof(ScrcpyDisplay),
             new PropertyMetadata(OnScrcpyChanged));
-        
+
+        private static readonly DependencyPropertyKey StreamIsLandscapePropertyKey = DependencyProperty.RegisterReadOnly(
+            nameof(StreamIsLandscape),
+            typeof(bool),
+            typeof(ScrcpyDisplay),
+            new PropertyMetadata(false));
+
+        public static readonly DependencyProperty StreamIsLandscapeProperty = StreamIsLandscapePropertyKey.DependencyProperty;
+
+        private static readonly DependencyPropertyKey DisplayedAspectRatioPropertyKey = DependencyProperty.RegisterReadOnly(
+            nameof(DisplayedAspectRatio),
+            typeof(double),
+            typeof(ScrcpyDisplay),
+            new PropertyMetadata(0.0));
+
+        public static readonly DependencyProperty DisplayedAspectRatioProperty = DisplayedAspectRatioPropertyKey.DependencyProperty;
+
+        /// <summary>
+        /// Whether the card wants a landscape presentation (the user's 设备方向 setting).
+        /// Together with <see cref="StreamIsLandscape"/> this decides the rotation in
+        /// <see cref="UpdateRotation"/>: the element size and the rotation are applied
+        /// atomically in one place, so they can never disagree (which showed the video
+        /// clipped to a middle strip).
+        /// </summary>
+        public static readonly DependencyProperty DesiredLandscapeProperty = DependencyProperty.Register(
+            nameof(DesiredLandscape),
+            typeof(bool),
+            typeof(ScrcpyDisplay),
+            new PropertyMetadata(false, OnRotationInputChanged));
+
         private Image? renderTarget;
         private WriteableBitmap? bmp;
 
@@ -60,6 +89,78 @@ namespace ScrcpyNet.Wpf
         {
             get => (Scrcpy)GetValue(ScrcpyProperty);
             set => SetValue(ScrcpyProperty, value);
+        }
+
+        /// <summary>
+        /// Whether the current video stream is landscape (frame width &gt; height). The card
+        /// layout combines this with the presentation orientation setting to rotate the
+        /// video only when the two orientations don't match (see ScrcpyItem.xaml).
+        /// </summary>
+        public bool StreamIsLandscape
+        {
+            get => (bool)GetValue(StreamIsLandscapeProperty);
+            private set => SetValue(StreamIsLandscapePropertyKey, value);
+        }
+
+        public bool DesiredLandscape
+        {
+            get => (bool)GetValue(DesiredLandscapeProperty);
+            set => SetValue(DesiredLandscapeProperty, value);
+        }
+
+        /// <summary>
+        /// Height/width ratio the video area should have so the device's real screen
+        /// ratio shows without letterboxing: derived from the actual stream size and the
+        /// rotation state. 0 while no stream is connected (the card falls back to the
+        /// default ratio from AppSettings). Updated whenever the stream size or the
+        /// presentation orientation changes.
+        /// </summary>
+        public double DisplayedAspectRatio
+        {
+            get => (double)GetValue(DisplayedAspectRatioProperty);
+            private set => SetValue(DisplayedAspectRatioPropertyKey, value);
+        }
+
+        /// <summary>
+        /// Single source of truth for the client-side rotation: rotates the element -90°
+        /// only when the stream orientation doesn't match the presentation orientation.
+        /// Uses a LayoutTransform (not a RenderTransform) so the change goes through the
+        /// layout path and reliably reaches the screen composition — a RenderTransform
+        /// here left the on-screen composition showing the unrotated middle strip.
+        /// </summary>
+        private void UpdateRotation()
+        {
+            bool rotate = DesiredLandscape != StreamIsLandscape;
+
+            UpdateDisplayedAspectRatio(rotate);
+
+            if (rotate == (LayoutTransform is System.Windows.Media.RotateTransform))
+                return;
+
+            LayoutTransform = rotate ? new System.Windows.Media.RotateTransform(-90) : null;
+
+            log.Information("Rotation update: streamLandscape={Stream} desiredLandscape={Desired} -> rotate={Rotate}",
+                StreamIsLandscape, DesiredLandscape, rotate);
+        }
+
+        /// <summary>
+        /// Video-area height/width for the device's real screen ratio: the stream shown
+        /// as-is needs height/width = h/w; when rotated the displayed box swaps, so the
+        /// ratio becomes w/h. 0 = unknown (no stream yet), the card then uses its default.
+        /// </summary>
+        private void UpdateDisplayedAspectRatio(bool rotate)
+        {
+            double ratio = streamWidth > 0 && streamHeight > 0
+                ? (rotate ? streamWidth / (double)streamHeight : streamHeight / (double)streamWidth)
+                : 0.0;
+
+            DisplayedAspectRatio = ratio;
+        }
+
+        private static void OnRotationInputChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            if (d is ScrcpyDisplay display)
+                display.UpdateRotation();
         }
 
         public override void OnApplyTemplate()
@@ -208,6 +309,10 @@ namespace ScrcpyNet.Wpf
                     // The DispatcherPriority has been randomly selected, so it might not be the optimal value.
                     Dispatcher.Invoke(() =>
                     {
+                        // The decoder is another source of video size changes (physical
+                        // rotation), keep the stream orientation in sync on every frame.
+                        UpdateStreamOrientation(frameData.Width, frameData.Height);
+
                         if (bmp == null || bmp.Width != frameData.Width || bmp.Height != frameData.Height)
                         {
                             bmp = new WriteableBitmap(frameData.Width, frameData.Height, 96, 96, System.Windows.Media.PixelFormats.Bgra32, null);
@@ -236,17 +341,63 @@ namespace ScrcpyNet.Wpf
             }
         }
 
+        /// <summary>
+        /// Keeps <see cref="StreamIsLandscape"/> and the stream size in sync with the
+        /// announced video size. Must run on the UI thread (int captures make the
+        /// cross-thread hop safe).
+        /// </summary>
+        private void UpdateStreamOrientation(int width, int height)
+        {
+            if (width <= 0 || height <= 0)
+                return;
+
+            streamWidth = width;
+            streamHeight = height;
+            StreamIsLandscape = width > height;
+            UpdateRotation();
+        }
+
+        /// <summary>Current stream size in pixels (0 = no stream), drives DisplayedAspectRatio.</summary>
+        private int streamWidth, streamHeight;
+
+        private void OnVideoSizeChanged()
+        {
+            // Fires on the video thread whenever the server (re)announces the video
+            // size, e.g. after the device was physically rotated.
+            if (!Dispatcher.CheckAccess())
+            {
+                Dispatcher.BeginInvoke(() => OnVideoSizeChanged());
+                return;
+            }
+
+            var scrcpy = Scrcpy;
+            if (scrcpy == null) return;
+
+            int width = scrcpy.Width, height = scrcpy.Height;
+            UpdateStreamOrientation(width, height);
+        }
+
         private static void OnScrcpyChanged(DependencyObject sender, DependencyPropertyChangedEventArgs e)
         {
             if (sender is ScrcpyDisplay display)
             {
                 // Unsubscribe on the old scrcpy
                 if (e.OldValue is Scrcpy old && old != null)
+                {
                     old.VideoStreamDecoder.OnFrame -= display.OnFrame;
+                    old.VideoSizeChanged -= display.OnVideoSizeChanged;
+                }
 
                 // Subscribe on the new scrcpy
                 if (e.NewValue is Scrcpy value && value != null)
+                {
                     value.VideoStreamDecoder.OnFrame += display.OnFrame;
+                    value.VideoSizeChanged += display.OnVideoSizeChanged;
+
+                    // The initial size was announced inside Start(), before we could
+                    // subscribe, so seed the orientation from the current dimensions.
+                    display.UpdateStreamOrientation(value.Width, value.Height);
+                }
             }
         }
     }

@@ -1,47 +1,112 @@
-﻿using ReactiveUI;
-using ReactiveUI.Fody.Helpers;
+using ReactiveUI;
+using ReactiveUI.Reactive;
+using ReactiveUI.SourceGenerators;
+using Serilog;
 using SharpAdbClient;
 using System;
 using System.Reactive;
+using System.Reactive.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace ScrcpyNet.Sample.ViewModels
 {
-    public class ScrcpyViewModel : ViewModelBase
+    public partial class ScrcpyViewModel : ViewModelBase
     {
-        [Reactive] public double BitrateKb { get; set; } = 1_000;
+        [Reactive] public partial double BitrateKb { get; set; }
         DeviceData device { get; set; }
         int port;
-        [Reactive] public bool IsConnected { get; private set; }
-        [Reactive] public string DeviceName { get; private set; } = "";
-        [Reactive] public Scrcpy? Scrcpy { get; private set; }
+        [Reactive] public partial bool IsConnected { get; private set; }
+        [Reactive] public partial bool IsConnecting { get; private set; }
+        [Reactive] public partial string DeviceName { get; private set; }
+        [Reactive] public partial Scrcpy? Scrcpy { get; private set; }
 
         public ReactiveCommand<Unit, Unit> ConnectCommand { get; }
         public ReactiveCommand<Unit, Unit> DisconnectCommand { get; }
 
         public ReactiveCommand<AndroidKeycode, Unit> SendKeycodeCommand { get; }
 
+        /// <summary>Serializes connect attempts against disconnects and orientation restarts.</summary>
+        private readonly SemaphoreSlim connectLock = new(1, 1);
+
         public ScrcpyViewModel(DeviceData d,int p)
         {
             port= p;
             device = d;
-            // `outputScheduler: RxApp.TaskpoolScheduler` is only needed for the WPF frontend
-            // TODO: This code only works ONCE. Aka you can't reconnect after disconnecting.
-            ConnectCommand = ReactiveCommand.CreateFromTask(Connect);
-            DisconnectCommand = ReactiveCommand.Create(Disconnect);
+            BitrateKb = 1_000;
+            DeviceName = "";
+            // Block the command while a connection exists or is being established, so the
+            // button shows as disabled and double clicks are ignored.
+            var canConnect = this.WhenAnyValue(
+                x => x.IsConnected,
+                x => x.IsConnecting,
+                (connected, connecting) => !connected && !connecting);
+            ConnectCommand = ReactiveCommand.CreateFromTask(Connect, canConnect);
+            DisconnectCommand = ReactiveCommand.Create(Disconnect, this.WhenAnyValue(x => x.IsConnected));
             SendKeycodeCommand = ReactiveCommand.Create<AndroidKeycode>(SendKeycode);
+
+            // Log command errors instead of letting them surface as unhandled.
+            ConnectCommand.ThrownExceptions.Subscribe(ex => Log.Error(ex, "Connect failed for {Serial}", device.Serial));
+            DisconnectCommand.ThrownExceptions.Subscribe(ex => Log.Error(ex, "Disconnect failed for {Serial}", device.Serial));
+            SendKeycodeCommand.ThrownExceptions.Subscribe(ex => Log.Error(ex, "SendKeycode failed for {Serial}", device.Serial));
+
+            // The orientation setting is display-only (client-side video rotation), so
+            // there is nothing to push to the device here — the UI handles it.
         }
 
         private async Task Connect()
         {
-            if (device == null) return;
-            if (Scrcpy != null) throw new Exception("Already connected.");
+            // Serialize with other connect attempts.
+            await connectLock.WaitAsync();
+            try
+            {
+                if (device == null) return;
+                // canExecute already prevents this; stay a no-op instead of throwing.
+                if (Scrcpy != null) return;
 
-            Scrcpy = new Scrcpy(device, port);
-            Scrcpy.Bitrate = (long)(BitrateKb * 1000);
-            await Task.Run(()=> Scrcpy.Start()) ;
-            DeviceName = Scrcpy.DeviceName;
-            IsConnected = true;
+                IsConnecting = true;
+                try
+                {
+                    var scrcpy = new Scrcpy(device, port);
+                    scrcpy.Bitrate = (long)(BitrateKb * 1000);
+                    // SM-G965U1 (Android 10) only offers the default vendor OMX.qcom.video.encoder.avc
+                    // and the software c2.android.avc.encoder for h264 — force the latter for this phone.
+                    if (device.Serial == "4254395143353098")
+                        scrcpy.VideoEncoder = "c2.android.avc.encoder";
+                    // The video always streams in the device's physical orientation; the
+                    // rotation setting is applied client-side on the display only.
+                    await Task.Run(() => scrcpy.Start());
+
+                    // The device can vanish mid-session (USB unplug, server crash): reflect
+                    // it in the UI. Fires on a threadpool thread; WPF marshals scalar
+                    // PropertyChanged events to the UI thread.
+                    scrcpy.Disconnected += () =>
+                    {
+                        Log.Warning("Connection to {Serial} was lost.", device.Serial);
+                        IsConnected = false;
+                        Scrcpy = null;
+                    };
+
+                    Scrcpy = scrcpy;
+                    DeviceName = scrcpy.DeviceName;
+                    IsConnected = true;
+                }
+                catch (Exception ex)
+                {
+                    // Devices connect automatically on startup, so one failing device
+                    // (offline, unauthorized, ...) must not take down the whole app.
+                    Log.Error(ex, "Couldn't connect to {Serial}", device.Serial);
+                    IsConnected = false;
+                }
+                finally
+                {
+                    IsConnecting = false;
+                }
+            }
+            finally
+            {
+                connectLock.Release();
+            }
         }
 
         private void Disconnect()

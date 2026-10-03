@@ -1,6 +1,8 @@
 # ScrcpyNet
 
-A work in progress reimplementation of the [scrcpy client](https://github.com/Genymobile/scrcpy/tree/master/app) in C#, with support for [AvaloniaUI](https://avaloniaui.net) and WPF.
+A work in progress reimplementation of the [scrcpy client](https://github.com/Genymobile/scrcpy/tree/master/app) in C#, with support for [AvaloniaUI](https://avaloniaui.org) and WPF.
+
+Compatible with **scrcpy-server 4.1** and built against **.NET 10**.
 
 ## Features
 
@@ -19,6 +21,8 @@ A work in progress reimplementation of the [scrcpy client](https://github.com/Ge
 
 The ScrcpyNet library should automatically copy the files from the deps/{shared,win64} folder to the ScrcpyNet folder inside your bin folder.
 If for some reason this doesn't happen then you can manually copy those files to a ScrcpyNet folder next to your executable.
+
+This folder contains `scrcpy-server.jar` (scrcpy-server 4.1), `adb.exe` and the FFmpeg 9 shared libraries (avcodec-63 & co) used by the video decoder.
 
 ## Usage
 
@@ -53,8 +57,9 @@ public MainWindow()
     //    .WriteTo.Debug()
     //    .CreateLogger();
 
-    // Set ffmpeg root path, the default VideoStreamDecoder needs this to be set.
-    ffmpeg.RootPath = "ScrcpyNet";
+    // (optional) Set the ffmpeg root path. By default the VideoStreamDecoder loads the
+    // native FFmpeg dlls from the "ScrcpyNet" folder next to your executable.
+    //ffmpeg.RootPath = "ScrcpyNet";
 
     // (optional) Start ADB server if needed
     var srv = new AdbServer();
@@ -71,9 +76,10 @@ public MainWindow()
         Close();
     }
 
-    // Create new scrcpy instance and set it on the ScrcpyDisplay
+    // Create new scrcpy instance (port of the local socket the server connects back to)
+    // and set it on the ScrcpyDisplay
     // NOTE: It is better to use data bindings for this.
-    ScrcpyDisplay.Scrcpy = new Scrcpy(devices[0]);
+    ScrcpyDisplay.Scrcpy = new Scrcpy(devices[0], 27183);
     ScrcpyDisplay.Scrcpy.Start(); // Start scrcpy and start streaming
 }
 

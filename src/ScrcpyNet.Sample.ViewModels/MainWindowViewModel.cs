@@ -1,10 +1,10 @@
 using DynamicData.Binding;
-using ReactiveUI;
-using ReactiveUI.Fody.Helpers;
+using ReactiveUI.Reactive;
 using Serilog;
 using SharpAdbClient;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reactive;
 using System.Reactive.Linq;
@@ -13,23 +13,31 @@ using System.Threading.Tasks;
 
 namespace ScrcpyNet.Sample.ViewModels
 {
-    public class MainWindowViewModel : ViewModelBase
+    public partial class MainWindowViewModel : ViewModelBase
     {
         public ReactiveCommand<Unit, List<ScrcpyViewModel>> LoadAvailableDevicesCommand { get; }
 
         public ObservableCollectionExtended<ScrcpyViewModel> Scrcpys { get; } = new ObservableCollectionExtended<ScrcpyViewModel>();
+
+        /// <summary>Global UI settings shown in the top bar (persisted across restarts).</summary>
+        public AppSettings Settings => AppSettings.Instance;
 
         private static readonly ILogger log = Log.ForContext<MainWindowViewModel>();
 
         public MainWindowViewModel()
         {
             LoadAvailableDevicesCommand = ReactiveCommand.Create(LoadAvailableDevices);
-            LoadAvailableDevicesCommand.Subscribe(devices =>
+            // The command delivers its result on the taskpool, hop back to the UI thread
+            // before touching the ObservableCollection.
+            LoadAvailableDevicesCommand
+                .ObserveOn(RxSchedulers.MainThreadScheduler)
+                .Subscribe(devices =>
             {
                 foreach (var item in devices)
                 {
                     Scrcpys.Add(item);
-                    //item.ConnectCommand.Execute();
+                    // Connect automatically on startup.
+                    item.ConnectCommand.Execute().Subscribe();
                 }
             });
             Task.Run(async () =>
@@ -40,7 +48,7 @@ namespace ScrcpyNet.Sample.ViewModels
                 {
                     if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                     {
-                        srv.StartServer("ScrcpyNet/adb.exe", false);
+                        srv.StartServer(Path.Combine(AppContext.BaseDirectory, "ScrcpyNet", "adb.exe"), false);
                     }
                     else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
                     {
@@ -62,10 +70,15 @@ namespace ScrcpyNet.Sample.ViewModels
             try
             {
                 var port = 27183;
-                string filePath = "Devices.txt";
+                // Resolve Devices.txt relative to the exe first — the process working
+                // directory is unpredictable when the app is launched from elsewhere.
+                string filePath = Path.Combine(AppContext.BaseDirectory, "Devices.txt");
+                if (!File.Exists(filePath))
+                    filePath = "Devices.txt";
                 FileReader fileReader = new FileReader();
                 List<string[]> lines = fileReader.ReadFile(filePath);
                 var devices = new AdbClient().GetDevices();
+                UiDiagnostics.Log($"LoadAvailableDevices: Devices.txt='{filePath}' entries={lines.Count}, adb devices={devices.Count}");
                 List<ScrcpyViewModel> list = new List<ScrcpyViewModel>();
                 foreach (var line in lines)
                 {
@@ -84,10 +97,12 @@ namespace ScrcpyNet.Sample.ViewModels
                         }
                     }
                 }
+                UiDiagnostics.Log($"LoadAvailableDevices: matched {list.Count} device(s)");
                 return list;
             }
             catch (Exception ex)
             {
+                UiDiagnostics.Log($"LoadAvailableDevices failed: {ex}");
                 log.Error("Couldn't load available devices", ex);
                 return new List<ScrcpyViewModel>();
             }

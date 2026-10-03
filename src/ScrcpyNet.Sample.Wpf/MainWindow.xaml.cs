@@ -1,8 +1,9 @@
-﻿using ScrcpyNet.Sample.ViewModels;
+using ReactiveUI;
+using ReactiveUI.Reactive;
+using ScrcpyNet.Sample.ViewModels;
 using System;
 using System.ComponentModel;
 using System.Windows;
-using System.Windows.Input;
 
 namespace ScrcpyNet.Sample.Wpf
 {
@@ -16,7 +17,7 @@ namespace ScrcpyNet.Sample.Wpf
             InitializeComponent();
         }
 
-        private void TextBox_PreviewTextInput(object sender, TextCompositionEventArgs e)
+        private void TextBox_PreviewTextInput(object sender, System.Windows.Input.TextCompositionEventArgs e)
         {
             e.Handled = !double.TryParse(e.Text, out _);
         }

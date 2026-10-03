@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 
@@ -12,9 +12,11 @@ public class FileReader
         {
             using (StreamReader sr = new StreamReader(filePath))
             {
-                string line;
+                string? line;
                 while ((line = sr.ReadLine()) != null)
                 {
+                    // Strip a UTF-8 BOM so the first serial matches adb exactly.
+                    line = line.TrimStart('\uFEFF');
                     var data = line.Split(" ");
                     if(data.Length==2)
                         lines.Add(data);

@@ -1,13 +1,16 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>netstandard2.1</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="ReactiveUI" Version="17.1.17" />
-    <PackageReference Include="ReactiveUI.Fody" Version="17.1.17" />
+    <!-- ReactiveUI 25 split into a System.Reactive based stack ("*.Reactive") and a lean stack.
+         These ViewModels use Rx (Unit, IObservable) so they reference the Reactive flavor. -->
+    <PackageReference Include="ReactiveUI.Reactive" Version="25.1.1" />
+    <PackageReference Include="DynamicData" Version="9.4.33" />
+    <PackageReference Include="ReactiveUI.SourceGenerators" Version="4.2.0" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,4 +1,4 @@
-﻿using Serilog;
+using Serilog;
 using SharpAdbClient;
 using System;
 using System.Buffers;
@@ -16,15 +16,50 @@ namespace ScrcpyNet
 {
     public class Scrcpy
     {
+        /// <summary>
+        /// scrcpy-server version this client implements. The server refuses to start when the
+        /// version passed as the first argument doesn't match exactly (Options.parse()).
+        /// </summary>
+        public const string ServerVersion = "4.1";
+
+        /// <summary>"h264" in ASCII (sc_demuxer_to_avcodec_id).</summary>
+        private const uint CodecIdH264 = 0x68323634;
+
+        // Streamer.PACKET_FLAG_* (server) / SC_PACKET_FLAG_* (app/src/demuxer.c)
+        private const ulong PacketFlagConfig = 1ul << 62;
+        private const ulong PacketPtsMask = (1ul << 61) - 1;
+
         int port;
         public string DeviceName { get; private set; } = ""; // 设备名称
         public int Width { get; internal set; } // 屏幕宽度
         public int Height { get; internal set; } // 屏幕高度
-        public long Bitrate { get; set; } = 200000; // 视频流比特率
+        public long Bitrate { get; set; } = 200000; // 视频流比特率（bit/s）
+        public int MaxFps { get; set; } // 0 = 不限制
+        public int MaxSize { get; set; } = 1920; // 0 = 不限制
+        public string? VideoEncoder { get; set; }
+        public ScrcpyCaptureOrientation CaptureOrientation { get; set; } = ScrcpyCaptureOrientation.Unlocked;
+        public bool ShowTouches { get; set; }
+        public bool StayAwake { get; set; }
         public string ScrcpyServerFile { get; set; } = "ScrcpyNet/scrcpy-server.jar"; // Scrcpy服务器文件路径
 
         public bool Connected { get; private set; } // 是否已连接
         public VideoStreamDecoder VideoStreamDecoder { get; } // 视频流解码器
+
+        /// <summary>
+        /// Raised whenever the video size changes (initial device info or a session meta
+        /// packet, e.g. after the device was rotated). Fires on the video thread.
+        /// </summary>
+        public event Action? VideoSizeChanged;
+
+        /// <summary>
+        /// Raised when the connection was lost unexpectedly (the device disconnected or the
+        /// server stopped streaming), after the internal sockets were released. Not raised
+        /// when <see cref="Stop"/> was called explicitly. Fires on a threadpool thread.
+        /// </summary>
+        public event Action? Disconnected;
+
+        /// <summary>Guards so the unexpected-disconnect handling only runs once per session.</summary>
+        private int streamEndedHandled;
 
         private Thread? videoThread; // 视频线程
         private Thread? controlThread; // 控制线程
@@ -39,7 +74,7 @@ namespace ScrcpyNet
         private static readonly ArrayPool<byte> pool = ArrayPool<byte>.Shared; // 字节数组池
         private static readonly ILogger log = Log.ForContext<VideoStreamDecoder>(); // 日志记录器
 
-        public Scrcpy(DeviceData device,int port, VideoStreamDecoder? videoStreamDecoder = null)
+        public Scrcpy(DeviceData device, int port, VideoStreamDecoder? videoStreamDecoder = null)
         {
             this.port = port;
             DeviceName = device.Name;
@@ -48,12 +83,6 @@ namespace ScrcpyNet
             VideoStreamDecoder = videoStreamDecoder ?? new VideoStreamDecoder();
             VideoStreamDecoder.Scrcpy = this;
         }
-
-        //public void SetDecoder(VideoStreamDecoder videoStreamDecoder)
-        //{
-        //    this.videoStreamDecoder = videoStreamDecoder;
-        //    this.videoStreamDecoder.Scrcpy = this;
-        //}
 
         /// <summary>
         /// 启动Scrcpy服务
@@ -64,65 +93,119 @@ namespace ScrcpyNet
             if (Connected)
                 throw new Exception("Already connected.");
 
-            MobileServerSetup();
+            Interlocked.Exchange(ref streamEndedHandled, 0);
 
-            listener = new TcpListener(IPAddress.Loopback, port);
-            listener.Start();
-
-            MobileServerStart();
-
-            int waitTimeMs = 0;
-            while (!listener.Pending())
+            try
             {
-                Thread.Sleep(10);
-                waitTimeMs += 10;
+                MobileServerSetup();
 
-                if (waitTimeMs > timeoutMs)
-                    throw new Exception("Timeout while waiting for server to connect.");
+                listener = new TcpListener(IPAddress.Loopback, port);
+                // Allow immediate rebind while sockets from a previous session are still
+                // in TIME_WAIT (quick disconnect->reconnect / batch restarts). The port is
+                // only held until both sockets below are accepted, never for the whole
+                // session, so this cannot silently shadow another listener for long.
+                listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                listener.Start();
+
+                MobileServerStart();
+
+                int waitTimeMs = 0;
+                while (!listener.Pending())
+                {
+                    Thread.Sleep(10);
+                    waitTimeMs += 10;
+
+                    if (waitTimeMs > timeoutMs)
+                        throw new Exception("Timeout while waiting for server to connect.");
+                }
+
+                // With audio disabled the server connects two sockets in this order: video, control.
+                videoClient = listener.AcceptTcpClient();
+                log.Information("Video socket connected.");
+
+                // The control connection arrives right after the video one, but "right
+                // after" is not "instantly": poll instead of checking Pending() once.
+                waitTimeMs = 0;
+                while (!listener.Pending())
+                {
+                    Thread.Sleep(10);
+                    waitTimeMs += 10;
+
+                    if (waitTimeMs > timeoutMs)
+                        throw new Exception("Server is not sending a second connection request. Is 'control' disabled?");
+                }
+
+                controlClient = listener.AcceptTcpClient();
+                log.Information("Control socket connected.");
+
+                // Both sockets are connected and the server never opens more, so stop
+                // listening now. Otherwise the listener would keep the port bound (and
+                // accept stray connections) until Stop() — or forever after an
+                // unexpected disconnect.
+                listener.Stop();
+                listener = null;
+
+                ReadDeviceInfo();
+
+                cts = new CancellationTokenSource();
+
+                videoThread = new Thread(VideoMain) { Name = "ScrcpyNet Video" };
+                controlThread = new Thread(ControllerMain) { Name = "ScrcpyNet Controller" };
+
+                videoThread.Start();
+                controlThread.Start();
+
+                Connected = true;
+
+                // ADB forward/reverse is not needed anymore.
+                MobileServerCleanup();
             }
-
-
-            videoClient = listener.AcceptTcpClient();
-            log.Information("Video socket connected.");
-
-
- 
-
-            if (!listener.Pending())
-                throw new Exception("Server is not sending a second connection request. Is 'control' disabled?");
-
-            controlClient = listener.AcceptTcpClient();
-            log.Information("Control socket connected.");
-
-            ReadDeviceInfo();
-
-            cts = new CancellationTokenSource();
-
-            videoThread = new Thread(VideoMain) { Name = "ScrcpyNet Video" };
-            controlThread = new Thread(ControllerMain) { Name = "ScrcpyNet Controller" };
-
-            videoThread.Start();
-            controlThread.Start();
-
-            Connected = true;
-
-            // ADB forward/reverse is not needed anymore.
-            MobileServerCleanup();
+            catch
+            {
+                // On failure release everything, otherwise the loopback port stays
+                // bound and the on-device server keeps running, which makes any
+                // reconnect attempt fail.
+                CleanupAfterStop();
+                throw;
+            }
         }
 
         /// <summary>
-        /// 停止Scrcpy服务
+        /// Releases sockets, threads and ADB forwards. Safe to call when partially started.
+        /// </summary>
+        private void CleanupAfterStop()
+        {
+            Connected = false;
+
+            try { cts?.Cancel(); } catch { /* already disposed */ }
+            try { videoClient?.Close(); } catch { /* ignore */ }
+            try { controlClient?.Close(); } catch { /* ignore */ }
+            try { listener?.Stop(); } catch { /* ignore */ }
+            try { MobileServerCleanup(); } catch (Exception ex) { log.Warning(ex, "ADB cleanup failed."); }
+
+            videoClient = null;
+            controlClient = null;
+            listener = null;
+        }
+
+        /// <summary>
+        /// 停止Scrcpy服务（幂等，重复调用不会抛异常）
         /// </summary>
         public void Stop()
         {
             if (!Connected)
-                throw new Exception("Not connected.");
+                return;
 
             cts?.Cancel();
 
+            // Closing the sockets aborts any blocking read, so the threads exit immediately.
+            videoClient?.Close();
+            controlClient?.Close();
+
             videoThread?.Join();
             controlThread?.Join();
-            listener?.Stop();
+
+            CleanupAfterStop();
         }
 
         /// <summary>
@@ -138,7 +221,7 @@ namespace ScrcpyNet
         }
 
         /// <summary>
-        /// 读取设备信息
+        /// 读取设备信息：64字节设备名 + 4字节编码器ID + 12字节会话元数据（视频尺寸）
         /// </summary>
         private void ReadDeviceInfo()
         {
@@ -150,34 +233,67 @@ namespace ScrcpyNet
             var infoStream = videoClient.GetStream();
             infoStream.ReadTimeout = 2000;
 
-            // 读取68字节的头部信息
-            var deviceInfoBuf = pool.Rent(68);
-            int bytesRead = infoStream.Read(deviceInfoBuf, 0, 64);
+            // 64字节设备名（send_device_meta=true）
+            var nameBuf = new byte[64];
+            if (ReadAll(infoStream, nameBuf, 0, 64) != 64)
+                throw new Exception("Failed to read the 64 byte device name.");
+            DeviceName = Encoding.UTF8.GetString(nameBuf).TrimEnd('\0');
+            log.Information("Device name: " + DeviceName);
 
-            // 检查读取的字节数是否为68
-            if (bytesRead != 64)
-                throw new Exception($"Expected to read exactly 68 bytes, but got {bytesRead} bytes.");
+            // 4字节编码器ID（send_stream_meta=true），例如 "h264" = 0x68323634
+            var codecBuf = new byte[4];
+            if (ReadAll(infoStream, codecBuf, 0, 4) != 4)
+                throw new Exception("Failed to read the 4 byte codec id.");
+            uint codecId = BinaryPrimitives.ReadUInt32BigEndian(codecBuf);
 
-            // 从头部信息中解码设备名称
-            var deviceInfoSpan = deviceInfoBuf.AsSpan();
-            //DeviceName = Encoding.UTF8.GetString(deviceInfoSpan[..64]).TrimEnd(new[] { '\0' });
-            //log.Information("Device name: " + DeviceName);
+            if (codecId == 0)
+                throw new Exception("The device explicitly disabled the video stream.");
+            if (codecId == 1)
+                throw new Exception("A configuration error occurred on the device.");
+            if (codecId != CodecIdH264)
+                throw new NotSupportedException($"Unsupported video codec id 0x{codecId:X8}, only h264 is supported.");
 
-            // 从头部信息中读取屏幕宽度和高度
-            //Width = BinaryPrimitives.ReadInt16BigEndian(deviceInfoSpan[64..]);
-            //Height = BinaryPrimitives.ReadInt16BigEndian(deviceInfoSpan[66..]);
-            //log.Information($"Initial texture: {Width}x{Height}");
+            // 12字节会话元数据：首字节最高位为1，包含初始视频尺寸
+            var sessionBuf = new byte[12];
+            if (ReadAll(infoStream, sessionBuf, 0, 12) != 12)
+                throw new Exception("Failed to read the 12 byte session meta.");
+            ParseSessionMeta(sessionBuf);
 
-            var video = infoStream.Read(deviceInfoBuf, 0, 12);
+            log.Information($"Initial texture: {Width}x{Height}");
+        }
 
-            // 将设备信息的缓冲区返回到池中
-            pool.Return(deviceInfoBuf);
+        /// <summary>
+        /// 解析会话元数据包（12字节：0x80标志 + client_resized标志 + 宽 + 高）
+        /// </summary>
+        private void ParseSessionMeta(byte[] header)
+        {
+            Width = BinaryPrimitives.ReadInt32BigEndian(header.AsSpan(4..));
+            Height = BinaryPrimitives.ReadInt32BigEndian(header.AsSpan(8..));
+            VideoSizeChanged?.Invoke();
         }
 
         /// <summary>
         /// 视频线程主函数
         /// </summary>
         private void VideoMain()
+        {
+            try
+            {
+                VideoLoop();
+            }
+            catch (Exception ex)
+            {
+                // The video thread must never let an exception escape: an unhandled
+                // exception on a thread takes down the whole process.
+                log.Error(ex, "Video thread crashed.");
+            }
+
+            OnStreamEnded();
+        }
+
+        /// <summary>Video receive loop, split from <see cref="VideoMain"/> so its whole
+        /// body — including the stream setup — is covered by the crash guard.</summary>
+        private void VideoLoop()
         {
             // Both of these should never happen.
             if (videoClient == null) throw new Exception("videoClient is null.");
@@ -191,59 +307,134 @@ namespace ScrcpyNet
 
             Stopwatch sw = new();
 
-            while (!cts.Token.IsCancellationRequested)
+            try
             {
-                // Read metadata (each packet starts with some metadata)
-                try
+                while (!cts.Token.IsCancellationRequested)
                 {
-                    bytesRead = videoStream.Read(metaBuf, 0, 12);
-                }
-                catch (IOException ex)
-                {
-                    // Ignore timeout errors.
-                    if (ex.InnerException is SocketException x && x.SocketErrorCode == SocketError.TimedOut)
+                    // Read the 12 byte frame header (pts+flags and packet size), this might
+                    // require more than one .Read() call.
+                    try
+                    {
+                        bytesRead = ReadAll(videoStream, metaBuf, 0, 12);
+                    }
+                    catch (IOException ex) when (ex.InnerException is SocketException x && x.SocketErrorCode == SocketError.TimedOut)
+                    {
+                        // Ignore timeout errors while waiting for the next frame.
                         continue;
-                    throw ex;
+                    }
+                    catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+                    {
+                        // The socket was closed by Stop() (disconnect / orientation
+                        // restart) or the device dropped the connection. Expected
+                        // during shutdown, must never escape the thread.
+                        log.Information("Video stream ended: {Message}", ex.Message);
+                        break;
+                    }
+
+                    // 0 bytes = the server closed the connection.
+                    if (bytesRead != 12)
+                    {
+                        log.Error("Video stream closed (read {BytesRead} of 12 header bytes).", bytesRead);
+                        break;
+                    }
+
+                    // Session meta packets (first byte 0x80) only announce a new video size,
+                    // no payload follows.
+                    if ((metaBuf[0] & 0x80) != 0)
+                    {
+                        ParseSessionMeta(metaBuf);
+                        log.Information("Video size changed to {Width}x{Height}.", Width, Height);
+                        continue;
+                    }
+
+                    ulong ptsAndFlags = BinaryPrimitives.ReadUInt64BigEndian(metaBuf.AsSpan());
+                    int packetSize = BinaryPrimitives.ReadInt32BigEndian(metaBuf.AsSpan(8..));
+
+                    if (packetSize <= 0)
+                    {
+                        log.Error("Invalid packet size {PacketSize}.", packetSize);
+                        break;
+                    }
+
+                    // The most significant bits of the pts carry flags: bit 62 marks a codec
+                    // config packet (SPS/PPS), bit 61 marks a key frame.
+                    bool isConfigPacket = (ptsAndFlags & PacketFlagConfig) != 0;
+                    long presentationTimeUs = isConfigPacket ? -1 : (long)(ptsAndFlags & PacketPtsMask);
+
+                    sw.Restart();
+
+                    // Read the whole frame, this might require more than one .Read() call.
+                    var packetBuf = pool.Rent(packetSize);
+                    int pos = 0;
+
+                    try
+                    {
+                        while (pos < packetSize && !cts.Token.IsCancellationRequested)
+                        {
+                            bytesRead = videoStream.Read(packetBuf, pos, packetSize - pos);
+
+                            if (bytesRead == 0)
+                                throw new EndOfStreamException("Unable to read any bytes.");
+
+                            pos += bytesRead;
+                        }
+
+                        if (pos == packetSize && !cts.Token.IsCancellationRequested)
+                        {
+                            VideoStreamDecoder?.Decode(packetBuf, 0, packetSize, presentationTimeUs);
+                            log.Verbose("Received and decoded a packet in {@ElapsedMilliseconds} ms", sw.ElapsedMilliseconds);
+                        }
+                    }
+                    catch (IOException ex) when (ex.InnerException is SocketException x && x.SocketErrorCode == SocketError.TimedOut)
+                    {
+                        log.Error(ex, "Timeout in the middle of a video packet, stopping the video thread.");
+                        break;
+                    }
+                    catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+                    {
+                        // Socket closed mid-frame (Stop()/device disconnect) — exit quietly.
+                        log.Information("Video stream ended mid-frame: {Message}", ex.Message);
+                        break;
+                    }
+                    finally
+                    {
+                        // Runs even when Decode threw, so the buffer never leaks.
+                        pool.Return(packetBuf);
+                    }
                 }
-
-                if (bytesRead != 12)
-                    this.Stop();
-                    //throw new Exception($"Expected to read exactly 12 bytes, but got {bytesRead} bytes.");
-
-                sw.Restart();
-
-                // Decode metadata
-                var metaSpan = metaBuf.AsSpan();
-                var presentationTimeUs = BinaryPrimitives.ReadInt64BigEndian(metaSpan);
-                var packetSize = BinaryPrimitives.ReadInt32BigEndian(metaSpan[8..]);
-
-                // Read the whole frame, this might require more than one .Read() call.
-                var packetBuf = pool.Rent(packetSize);
-                var pos = 0;
-                var bytesToRead = packetSize;
-
-                while (bytesToRead != 0 && !cts.Token.IsCancellationRequested)
-                {
-                    bytesRead = videoStream.Read(packetBuf, pos, bytesToRead);
-
-                    if (bytesRead == 0)
-                        throw new Exception("Unable to read any bytes.");
-
-                    pos += bytesRead;
-                    bytesToRead -= bytesRead;
-                }
-
-                if (!cts.Token.IsCancellationRequested)
-                {
-                    //Log.Verbose($"Presentation Time: {presentationTimeUs}us, PacketSize: {packetSize} bytes");
-                    VideoStreamDecoder?.Decode(packetBuf, presentationTimeUs);
-                    log.Verbose("Received and decoded a packet in {@ElapsedMilliseconds} ms", sw.ElapsedMilliseconds);
-                }
-
-                sw.Stop();
-
-                pool.Return(packetBuf);
             }
+            finally
+            {
+                pool.Return(metaBuf);
+            }
+        }
+
+        /// <summary>
+        /// Called when the video thread ends, no matter why. Cleans up without joining the
+        /// current thread (Stop() would deadlock there) and raises <see cref="Disconnected"/>
+        /// once, unless the end was the normal shutdown path of <see cref="Stop"/>.
+        /// </summary>
+        private void OnStreamEnded()
+        {
+            // Stop() cancels the token before closing the sockets, so a cancelled token
+            // means the normal shutdown path already did (or is doing) the cleanup.
+            if (cts == null || cts.IsCancellationRequested)
+                return;
+
+            if (Interlocked.Exchange(ref streamEndedHandled, 1) != 0)
+                return;
+
+            log.Information("Connection lost, cleaning up.");
+
+            // CleanupAfterStop() is idempotent and never joins threads, but the ADB calls
+            // in it can block, so run it off the video thread.
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                CleanupAfterStop();
+
+                try { Disconnected?.Invoke(); }
+                catch (Exception ex) { log.Error(ex, "A Disconnected event handler threw."); }
+            });
         }
 
         /// <summary>
@@ -251,20 +442,30 @@ namespace ScrcpyNet
         /// </summary>
         private async void ControllerMain()
         {
-            // Both of these should never happen.
-            if (controlClient == null) throw new Exception("controlClient is null.");
-            if (cts == null) throw new Exception("cts is null.");
-
-            var stream = controlClient.GetStream();
-
             try
             {
+                // Both of these should never happen.
+                if (controlClient == null) throw new Exception("controlClient is null.");
+                if (cts == null) throw new Exception("cts is null.");
+
+                var stream = controlClient.GetStream();
+
                 await foreach (var cmd in controlChannel.Reader.ReadAllAsync(cts.Token))
                 {
                     ControllerSend(stream, cmd);
                 }
             }
             catch (OperationCanceledException) { }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+            {
+                // The socket was closed by Stop() or the device disconnected.
+                log.Information("Control stream ended: {Message}", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                // This is async void — an escaping exception would kill the process.
+                log.Error(ex, "Control thread crashed.");
+            }
         }
 
         /// <summary>
@@ -274,9 +475,32 @@ namespace ScrcpyNet
         /// <param name="cmd">控制消息</param>
         private void ControllerSend(NetworkStream stream, IControlMessage cmd)
         {
-            
-            var bytes = cmd.ToBytes();
-            stream.Write(bytes);
+            try
+            {
+                var bytes = cmd.ToBytes();
+                stream.Write(bytes);
+            }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+            {
+                // Socket gone (Stop() ran or the device disconnected); drop the message.
+                log.Information("Control message dropped, socket closed: {Message}", ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 读取直到缓冲区填满，返回读取的总字节数（流关闭时可能小于 count）
+        /// </summary>
+        private static int ReadAll(NetworkStream stream, byte[] buffer, int offset, int count)
+        {
+            int total = 0;
+            while (total < count)
+            {
+                int bytesRead = stream.Read(buffer, offset + total, count - total);
+                if (bytesRead == 0)
+                    break;
+                total += bytesRead;
+            }
+            return total;
         }
 
         /// <summary>
@@ -289,8 +513,9 @@ namespace ScrcpyNet
             // Push scrcpy-server.jar
             UploadMobileServer();
 
-            // Create port reverse rule
-            adb.CreateReverseForward(device, "localabstract:scrcpy", "tcp:"+ port, true);
+            // Create port reverse rule. The server uses the plain "scrcpy" socket name
+            // because we don't pass a scid.
+            adb.CreateReverseForward(device, "localabstract:scrcpy", "tcp:" + port, true);
         }
 
         /// <summary>
@@ -313,14 +538,6 @@ namespace ScrcpyNet
             var cts = new CancellationTokenSource();
             var receiver = new SerilogOutputReceiver();
 
-            //string version = "1.23";
-            string version = "2.4";
-            int maxFramerate = 0;
-            ScrcpyLockVideoOrientation orientation = ScrcpyLockVideoOrientation.Orientation1; // -1 means allow rotate
-            bool control = true;
-            bool showTouches = false;
-            bool stayAwake = false;
-
             var cmds = new List<string>
                     {
                         "CLASSPATH=/data/local/tmp/scrcpy-server.jar",
@@ -332,30 +549,46 @@ namespace ScrcpyNet
                         // App entry point, or something like that.
                         "com.genymobile.scrcpy.Server",
 
-                        version,
-                        "log_level=debug",
-                        $"bit_rate={Bitrate}"
+                        // Must match the server version exactly.
+                        ServerVersion,
+
+                        "log_level=info",
+                        "video=true",
+                        "audio=false",
+                        "video_codec=h264",
+                        $"video_bit_rate={Bitrate}",
+                        $"max_size={MaxSize}",
+                        "tunnel_forward=false",
+                        "control=true",
+                        "display_id=0",
+                        $"show_touches={ShowTouches}",
+                        $"stay_awake={StayAwake}",
+                        "power_off_on_close=false",
+                        "downsize_on_error=true",
+                        // We never read device messages from the control socket, so the
+                        // server must not send any (otherwise its write would block eventually).
+                        "clipboard_autosync=false",
+                        "cleanup=true",
                     };
 
-            if (maxFramerate != 0)
-                cmds.Add($"max_fps={maxFramerate}");
+            if (!string.IsNullOrWhiteSpace(VideoEncoder))
+                cmds.Add($"video_encoder={VideoEncoder}");
 
-            if (orientation != ScrcpyLockVideoOrientation.Unlocked)
-                cmds.Add($"lock_video_orientation={(int)orientation}");
+            if (MaxFps != 0)
+                cmds.Add($"max_fps={MaxFps}");
 
-            cmds.Add("tunnel_forward=false");
-            //cmds.Add("crop=-");
-            cmds.Add($"control={control}");
-            cmds.Add("display_id=0");
-            cmds.Add($"show_touches={showTouches}");
-            cmds.Add($"stay_awake={stayAwake}");
-            cmds.Add("power_off_on_close=false");
-            cmds.Add("downsize_on_error=true");
-            cmds.Add("max_size=1920");
-            cmds.Add("audio=false");
-            cmds.Add("cleanup=true");
-
-            //cmds.Add("raw_stream=true");
+            if (CaptureOrientation != ScrcpyCaptureOrientation.Unlocked)
+            {
+                cmds.Add("capture_orientation=" + CaptureOrientation switch
+                {
+                    ScrcpyCaptureOrientation.Initial => "@",
+                    ScrcpyCaptureOrientation.Orientation0 => "@0",
+                    ScrcpyCaptureOrientation.Orientation90 => "@90",
+                    ScrcpyCaptureOrientation.Orientation180 => "@180",
+                    ScrcpyCaptureOrientation.Orientation270 => "@270",
+                    _ => throw new InvalidOperationException($"Unexpected {nameof(CaptureOrientation)} value."),
+                });
+            }
 
             string command = string.Join(" ", cmds);
 

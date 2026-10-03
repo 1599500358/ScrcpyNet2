@@ -2,6 +2,7 @@ using FFmpeg.AutoGen;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Serilog;
 using SharpAdbClient;
+using System;
 using System.IO;
 using System.Linq;
 
@@ -13,13 +14,24 @@ namespace ScrcpyNet.Test
         [AssemblyInitialize]
         public static void AssemblyInitialize(TestContext _)
         {
-            // HACK:
-            ffmpeg.RootPath = "ScrcpyNet";
+            ffmpeg.RootPath = Path.Combine(AppContext.BaseDirectory, "ScrcpyNet");
 
             Log.Logger = new LoggerConfiguration()
                 .MinimumLevel.Verbose()
                 .WriteTo.Console()
                 .CreateLogger();
+        }
+
+        [TestMethod]
+        public void VideoStreamDecoderConstruction()
+        {
+            Console.WriteLine($"CWD: {Environment.CurrentDirectory}");
+            Console.WriteLine($"RootPath: {ffmpeg.RootPath}");
+            Console.WriteLine($"avcodec-63.dll exists: {File.Exists(Path.Combine(ffmpeg.RootPath ?? "", "avcodec-63.dll"))}");
+
+            // Loads the native FFmpeg dlls from deps (avcodec-63 & co) and opens the
+            // h264 decoder + parser.
+            using var dec = new VideoStreamDecoder();
         }
 
         [TestMethod]
@@ -30,24 +42,44 @@ namespace ScrcpyNet.Test
 
             if (device == null)
             {
-                Assert.Inconclusive("No device connected."); 
+                Assert.Inconclusive("No device connected.");
                 return;
             }
 
-            var adc = new Scrcpy(device);
+            // A fixed port (e.g. the default 27183) collides with other local scrcpy
+            // clients that may be running (the sample app binds one port per device), so
+            // grab a free one instead.
+            var adc = new Scrcpy(device, GetFreePort());
             adc.Start();
+        }
+
+        private static int GetFreePort()
+        {
+            var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+            listener.Start();
+            int port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+            listener.Stop();
+            return port;
         }
 
         [TestMethod]
         public void StreamDecoder()
         {
+            const string FrameFile = @"L:\Repos\LupoCV\LupoCV.CLI\bin\Debug\netcoreapp3.1\frames.avc";
+            if (!File.Exists(FrameFile))
+            {
+                Assert.Inconclusive($"Frame dump not found: {FrameFile}");
+                return;
+            }
+
             VideoStreamDecoder dec = new VideoStreamDecoder();
-            FileStream fs = File.OpenRead(@"L:\Repos\LupoCV\LupoCV.CLI\bin\Debug\netcoreapp3.1\frames.avc");
+            using FileStream fs = File.OpenRead(FrameFile);
 
             byte[] buffer = new byte[1024 * 16];
+            int bytesRead;
 
-            while (fs.Read(buffer) > 0)
-                dec.Decode(buffer);
+            while ((bytesRead = fs.Read(buffer)) > 0)
+                dec.Decode(buffer, 0, bytesRead);
         }
     }
 }

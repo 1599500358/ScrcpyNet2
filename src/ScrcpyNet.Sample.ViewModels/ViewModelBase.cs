@@ -1,8 +1,8 @@
-using ReactiveUI;
+using ReactiveUI.Reactive;
 
 namespace ScrcpyNet.Sample.ViewModels
 {
-    public class ViewModelBase : ReactiveObject
+    public partial class ViewModelBase : ReactiveObject
     {
     }
 }

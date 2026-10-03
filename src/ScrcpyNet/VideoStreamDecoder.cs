@@ -1,7 +1,9 @@
 ﻿using FFmpeg.AutoGen.Abstractions;
+using FFmpeg.AutoGen.Bindings.DynamicallyLoaded;
 using Serilog;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text;
 
@@ -106,19 +108,33 @@ namespace ScrcpyNet
 
         public VideoStreamDecoder()
         {
+            // This library calls FFmpeg through FFmpeg.AutoGen.Abstractions, whose function
+            // vectors are only installed by DynamicallyLoadedBindings.Initialize(). The
+            // native dlls (avcodec-63 & co) are shipped in a "ScrcpyNet" folder next to the
+            // application, fall back to it when the bindings were not configured already.
+            if (string.IsNullOrEmpty(DynamicallyLoadedBindings.LibrariesPath))
+                DynamicallyLoadedBindings.LibrariesPath = Path.Combine(AppContext.BaseDirectory, "ScrcpyNet");
+            DynamicallyLoadedBindings.Initialize();
+
             ConfigureHWDecoder(out var deviceType);
             
             codec = ffmpeg.avcodec_find_decoder(AVCodecID.AV_CODEC_ID_H264);
             if (codec == null) throw new Exception("Couldn't find AVCodec for AV_CODEC_ID_H264.");
 
-            parser = ffmpeg.av_parser_init((int)codec->id);
+            parser = ffmpeg.av_parser_init(codec->id);
             if (parser == null) throw new Exception("Couldn't initialize AVCodecParserContext.");
 
             ctx = ffmpeg.avcodec_alloc_context3(codec);
             if (ctx == null) throw new Exception("Couldn't allocate AVCodecContext.");
             if (deviceType != AVHWDeviceType.AV_HWDEVICE_TYPE_NONE)
             {
-                ffmpeg.av_hwdevice_ctx_create(&ctx->hw_device_ctx, deviceType, null, null, 0);
+                int retHw = ffmpeg.av_hwdevice_ctx_create(&ctx->hw_device_ctx, deviceType, null, null, 0);
+                if (retHw < 0)
+                {
+                    // Not fatal: decoding continues in software.
+                    log.Warning("Couldn't create the {DeviceType} hardware device, falling back to software decoding.", deviceType);
+                    ctx->hw_device_ctx = null;
+                }
             }
             int ret = ffmpeg.avcodec_open2(ctx, codec, null);
             if (ret < 0) throw new Exception("Couldn't open AVCodecContext.");
@@ -144,6 +160,15 @@ namespace ScrcpyNet
                 lastFrameRefCount++;
                 return lastFrame;
             }
+        }
+
+        private static bool IsHardwarePixelFormat(AVPixelFormat format)
+        {
+            // Hardware formats (dxva2_vld, d3d11, vaapi, ...) have AV_PIX_FMT_FLAG_HWACCEL set
+            // and contain a device buffer instead of raw pixels, so they can't be fed to
+            // swscale directly.
+            var desc = ffmpeg.av_pix_fmt_desc_get(format);
+            return desc != null && (desc->flags & ffmpeg.AV_PIX_FMT_FLAG_HWACCEL) != 0;
         }
 
         private static void ConfigureHWDecoder(out AVHWDeviceType HWtype)
@@ -182,10 +207,15 @@ namespace ScrcpyNet
 
         public void Decode(byte[] data, long pts = -1)
         {
+            Decode(data, 0, data.Length, pts);
+        }
+
+        public void Decode(byte[] data, int index, int count, long pts = -1)
+        {
             fixed (byte* dataPtr = data)
             {
-                byte* ptr = dataPtr;
-                int dataSize = data.Length;
+                byte* ptr = dataPtr + index;
+                int dataSize = count;
 
                 while (dataSize > 0)
                 {
@@ -226,21 +256,39 @@ namespace ScrcpyNet
 
                 while (ret >= 0)
                 {
-                    AVFrame frame;
                     ret = ffmpeg.avcodec_receive_frame(ctx, _frame);
 
-                    if (ctx->hw_device_ctx != null)
+                    // AVERROR and AVERROR_EOF are already negative error codes here —
+                    // wrapping AVERROR_EOF in AVERROR() again would make it positive and
+                    // the comparison would never match.
+                    if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || ret == ffmpeg.AVERROR_EOF)
+                        return;
+
+                    if (ret < 0)
                     {
-                        ffmpeg.av_hwframe_transfer_data(_receivedFrame, _frame, 0);
-                        frame= *_receivedFrame;
+                        log.Error("Error receiving a frame from the decoder ({ErrorCode}).", ret);
+                        return;
+                    }
+
+                    AVFrame frame;
+                    if (IsHardwarePixelFormat((AVPixelFormat)_frame->format))
+                    {
+                        // The decoder produced a hardware surface, copy it to system memory.
+                        ffmpeg.av_frame_unref(_receivedFrame);
+                        int retTransfer = ffmpeg.av_hwframe_transfer_data(_receivedFrame, _frame, 0);
+                        if (retTransfer < 0)
+                        {
+                            log.Error("av_hwframe_transfer_data failed ({ErrorCode}), dropping the frame.", retTransfer);
+                            continue;
+                        }
+                        frame = *_receivedFrame;
                     }
                     else
                     {
+                        // Software decoding (or the hardware pipeline failed and the decoder
+                        // fell back to software, which we can't detect via hw_device_ctx).
                         frame = *_frame;
                     }
-
-                    if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || ret == ffmpeg.AVERROR(ffmpeg.AVERROR_EOF))
-                        return;
 
                     FrameCount++;
 
@@ -258,7 +306,7 @@ namespace ScrcpyNet
                     byte*[] dest = { destBufferPtr };
 
                     // This `free`s the old context if needed, so there is no leak here.
-                    swsContext = ffmpeg.sws_getCachedContext(swsContext, frame.width, frame.height, (AVPixelFormat)frame.format, frame.width, frame.height, AVPixelFormat.AV_PIX_FMT_BGRA, ffmpeg.SWS_BICUBIC, null, null, null);
+                    swsContext = ffmpeg.sws_getCachedContext(swsContext, frame.width, frame.height, (AVPixelFormat)frame.format, frame.width, frame.height, AVPixelFormat.AV_PIX_FMT_BGRA, (int)SwsFlags.SWS_BICUBIC, null, null, null);
 
                     if (swsContext == null) throw new Exception("Couldn't allocate SwsContext.");
 
