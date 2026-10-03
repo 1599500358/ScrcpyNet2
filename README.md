@@ -1,89 +1,89 @@
 # ScrcpyNet
 
-A work in progress reimplementation of the [scrcpy client](https://github.com/Genymobile/scrcpy/tree/master/app) in C#, with support for [AvaloniaUI](https://avaloniaui.org) and WPF.
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-Compatible with **scrcpy-server 4.1** and built against **.NET 10**.
+A C#/.NET reimplementation of the [scrcpy client](https://github.com/Genymobile/scrcpy/tree/master/app) protocol, plus a WPF sample application for **Android device farms** (群控): mirror and control a whole fleet of phones from a single window.
+
+Compatible with **scrcpy-server 4.1** (the latest release) and built against **.NET 10**.
+
+## Projects
+
+| Project | Description |
+|---|---|
+| `ScrcpyNet` | Core library: scrcpy-server 4.1 protocol, H.264 video decoding, control messages |
+| `ScrcpyNet.Wpf` | WPF `ScrcpyDisplay` control: live video with automatic rotation and the device's real aspect ratio |
+| `ScrcpyNet.Sample.Wpf` | **Device farm app (群控)**: connects every device listed in `Devices.txt` automatically and shows them as a grid of live cards (2–5 per row) |
 
 ## Features
 
-- Basic keyboard input support
-- Basic touch and swiping
-- Automatic screen rotation
-- Window resizing
-- **No** audio support
-- _Usually_ crash free
-
-## Screenshot
-
-![Screenshot](https://i.imgur.com/yGTl9Vy.png)
+- **Multi-device**: one `Scrcpy` instance per device, each with its own local port — connect to dozens of phones at the same time
+- **scrcpy-server 4.1 protocol**: key/value server options, device/codec/session meta parsing, and dynamic video size changes (device rotation) via session meta packets — no reconnect needed
+- **Video**: H.264 with hardware decoding (DXVA2 etc.) and automatic fallback to software decoding, powered by the FFmpeg 9 shared libraries
+- **Input**: keycodes, touch with pressure, scroll (range ±16), UTF-8 text injection, back/screen-on, display power on/off, rotate device
+- **Server options**: bitrate, max size, max fps, capture orientation lock, show touches, stay awake, video encoder selection
+- **Resilience**: a `Disconnected` event fires when a device vanishes mid-session, `Stop()` is idempotent, and the streaming threads can never crash the process
+- **No** audio support (audio is disabled server-side)
 
 ## Setup
 
-The ScrcpyNet library should automatically copy the files from the deps/{shared,win64} folder to the ScrcpyNet folder inside your bin folder.
-If for some reason this doesn't happen then you can manually copy those files to a ScrcpyNet folder next to your executable.
+The ScrcpyNet library should automatically copy the files from the `deps/{shared,win64}` folder to the `ScrcpyNet` folder inside your bin folder.
+If for some reason this doesn't happen, copy those files to a `ScrcpyNet` folder next to your executable.
 
-This folder contains `scrcpy-server.jar` (scrcpy-server 4.1), `adb.exe` and the FFmpeg 9 shared libraries (avcodec-63 & co) used by the video decoder.
+This folder contains `scrcpy-server.jar` (scrcpy-server 4.1), `adb.exe` and the FFmpeg 9 shared libraries (`avcodec-63` & co) used by the video decoder.
 
-## Usage
+## Usage (library)
 
-### WPF
-
-Install both the `ScrcpyNet` and `ScrcpyNet.Wpf` packages from nuget.
-
-Add the xml namespace in whatever xaml file you want to use it. In our example we are going to use MainWindow.xaml
+Reference the `ScrcpyNet` and `ScrcpyNet.Wpf` projects (or packages, if published) and add the xml namespace to your xaml file:
 
 ```xml
 xmlns:scrcpy="clr-namespace:ScrcpyNet.Wpf;assembly=ScrcpyNet.Wpf"
 ```
 
-Now you can use the ScrcpyDisplay control. In this example we give it a name because we set the `ScrcpyDisplay.Scrcpy` property from the code-behind, but you can also use XAML bindings (as seen in the [WPF example project](https://github.com/Fusion86/ScrcpyNet/tree/master/src/ScrcpyNet.Sample.Wpf)).
+Place the display control:
 
 ```xml
 <scrcpy:ScrcpyDisplay x:Name="ScrcpyDisplay"/>
 ```
 
-Next we need to set the `ScrcpyDisplay.Scrcpy` property. The example below shows how to do this in the MainWindow.xaml.cs code-behind.
+Create a `Scrcpy` instance per device and start it. Each concurrent instance needs **its own loopback port** — the sample app assigns 27183, 27184, 27185, … one per device.
 
 ```cs
 public MainWindow()
 {
     InitializeComponent();
 
-    // If you want logging
-    // This uses the Serilog library
+    // (optional) Logging via Serilog
     //Log.Logger = new LoggerConfiguration()
     //    .MinimumLevel.Verbose()
     //    .WriteTo.Console()
-    //    .WriteTo.Debug()
     //    .CreateLogger();
 
-    // (optional) Set the ffmpeg root path. By default the VideoStreamDecoder loads the
-    // native FFmpeg dlls from the "ScrcpyNet" folder next to your executable.
-    //ffmpeg.RootPath = "ScrcpyNet";
-
-    // (optional) Start ADB server if needed
+    // (optional) Start the ADB server if needed
     var srv = new AdbServer();
     if (!srv.GetStatus().IsRunning)
-        srv.StartServer("ScrcpyNet/adb.exe", false);
+        srv.StartServer(Path.Combine(AppContext.BaseDirectory, "ScrcpyNet", "adb.exe"), false);
 
     // Find connected devices
     var devices = new AdbClient().GetDevices();
 
-    // (optional) Show message and exit when no devices are connected.
     if (devices.Count == 0)
     {
         MessageBox.Show("No device connected!");
         Close();
+        return;
     }
 
-    // Create new scrcpy instance (port of the local socket the server connects back to)
-    // and set it on the ScrcpyDisplay
-    // NOTE: It is better to use data bindings for this.
+    // Create a scrcpy instance (the second argument is the local port the server
+    // connects back to) and set it on the ScrcpyDisplay.
+    // NOTE: Data bindings are nicer — see the sample app.
     ScrcpyDisplay.Scrcpy = new Scrcpy(devices[0], 27183);
     ScrcpyDisplay.Scrcpy.Start(); // Start scrcpy and start streaming
+
+    // React to unexpected disconnects (USB unplug, server crash, ...)
+    ScrcpyDisplay.Scrcpy.Disconnected += () => { /* update your UI */ };
 }
 
-// Make sure to disconnect your device when closing the application, or it will hang forever.
+// Disconnect when closing, or the device session will linger.
 protected override void OnClosing(CancelEventArgs e)
 {
     ScrcpyDisplay.Scrcpy?.Stop();
@@ -91,25 +91,29 @@ protected override void OnClosing(CancelEventArgs e)
 }
 ```
 
-### Avalonia
+## Usage (device farm app / 群控)
 
-The Avalonia nuget package isn't fully function yet.
+`ScrcpyNet.Sample.Wpf` is a ready-to-use group-control tool:
+
+- List your devices in `Devices.txt` next to the executable, one per line: `<serial> <name>`
+- On startup it enumerates the adb devices, matches them against `Devices.txt` and connects to all of them automatically
+- The top bar sets the cards per row (2–5) and the presentation orientation (portrait/landscape — applied client-side, the video itself follows the device)
+- Settings persist in `%AppData%\ScrcpyNet\settings.json`; a lightweight diagnostic log is written to `%AppData%\ScrcpyNet\debug.log`
 
 ## Troubleshooting
 
-### I can't select my device from the dropdown
+### My device doesn't show up or can't connect
 
-Ensure that you accepted the connection on your device too. You only need to do this once per computer/phone. You can use the `adb devices` command to check if your computer can detect your device.
+Make sure USB debugging is enabled and that you accepted the connection prompt on the phone (once per computer/phone). `adb devices` must list the device with status `device` — if it says `unauthorized`, reconnect and accept the prompt on the screen.
 
 ## Notes
 
-This code (ab)uses `unsafe` code inside C#.
-
-The Avalonia frontend is quite crappy, but I believe this is also because of some bugs inside Avalonia (frames don't feel 'smooth' and sometimes it crashes).
-
-If you set the bitrate too high the videodecoder might not be able to keep up and lag. Or you'll get an timeout error which crashes the program.
+- scrcpy-server 4.1 deletes its own jar from `/data/local/tmp` when it exits (`cleanup=true`). `Scrcpy.Start()` re-pushes it on every start, so reconnecting always works.
+- This code (ab)uses `unsafe` C# for the FFmpeg interop.
+- If you set the bitrate too high the decoder might not keep up and the video lags.
 
 ## Credits
 
-- [Genymobile/scrcpy](https://github.com/Genymobile/scrcpy) - this code is based on their client implementation, and we use their scrcpy-server.jar
-- [The Android Open Source Project](https://android.googlesource.com/platform/frameworks/native/+/master/include/android) - for the input/keycodes
+- [Genymobile/scrcpy](https://github.com/Genymobile/scrcpy) — the protocol and server come from this project; the client is a reimplementation of theirs
+- [The Android Open Source Project](https://android.googlesource.com/platform/frameworks/native/+/master/include/android) — for the input/keycodes
+- [Fusion86/ScrcpyNet](https://github.com/Fusion86/ScrcpyNet) — the original library this fork evolved from
