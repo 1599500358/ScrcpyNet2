@@ -44,6 +44,7 @@
 
                 <TextBlock Grid.Column="1"
                            Text="{Binding DeviceName, FallbackValue=等待设备…}"
+                           ToolTip="{Binding Serial, StringFormat='序列号: {0}'}"
                            Style="{StaticResource Text.CardTitle}"/>
 
                 <TextBlock Grid.Column="2" Style="{StaticResource Text.Status}"/>
@@ -180,6 +181,28 @@
                     <!-- Remove -->
                     <Button Content="&#xE738;" ToolTip="音量-" Command="{Binding SendKeycodeCommand}"
                             CommandParameter="{x:Static scrcpy:AndroidKeycode.AKEYCODE_VOLUME_DOWN}"/>
+                </WrapPanel>
+
+                <!-- Device registry actions (database-backed, work while disconnected) -->
+                <WrapPanel>
+                    <!-- Separator -->
+                    <Rectangle Width="1" Height="20" Margin="8,0"
+                               Fill="{StaticResource Brush.CardBorder}"/>
+
+                    <!-- Rename -->
+                    <Button Content="&#xE70F;" FontSize="13" ToolTip="重命名" Command="{Binding RenameDeviceCommand}"/>
+                    <!-- Remove from device list (hover turns red) -->
+                    <Button Content="&#xE74D;" FontSize="12" ToolTip="从设备列表移除" Command="{Binding RemoveDeviceCommand}">
+                        <Button.Style>
+                            <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+                                <Style.Triggers>
+                                    <Trigger Property="IsMouseOver" Value="True">
+                                        <Setter Property="Foreground" Value="#EF4444"/>
+                                    </Trigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Button.Style>
+                    </Button>
                 </WrapPanel>
             </WrapPanel>
         </Grid>

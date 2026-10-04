@@ -12,7 +12,7 @@ Compatible with **scrcpy-server 4.1** (the latest release) and built against **.
 |---|---|
 | `ScrcpyNet` | Core library: scrcpy-server 4.1 protocol, H.264 video decoding, control messages |
 | `ScrcpyNet.Wpf` | WPF `ScrcpyDisplay` control: live video with automatic rotation and the device's real aspect ratio |
-| `ScrcpyNet.Sample.Wpf` | **Device farm app (群控)**: connects every device listed in `Devices.txt` automatically and shows them as a grid of live cards (2–5 per row) |
+| `ScrcpyNet.Sample.Wpf` | **Device farm app (群控)**: connects every device registered in the SQLite device database automatically and shows them as a grid of live cards (2–5 per row) |
 
 ## Features
 
@@ -95,8 +95,10 @@ protected override void OnClosing(CancelEventArgs e)
 
 `ScrcpyNet.Sample.Wpf` is a ready-to-use group-control tool:
 
-- List your devices in `Devices.txt` next to the executable, one per line: `<serial> <name>`
-- On startup it enumerates the adb devices, matches them against `Devices.txt` and connects to all of them automatically
+- Devices are managed through a SQLite database at `%AppData%\ScrcpyNet\devices.db` (each device: serial + user-assigned name, shown as the card title)
+- Manage the list from the app itself: **添加设备** in the top bar registers a device, the rename/delete buttons on each card edit or remove it — no more hand-editing text files
+- On the first run a legacy `Devices.txt` next to the executable (`<serial> <name>` per line) is imported into the database once; the txt file is ignored afterwards
+- On startup it enumerates the adb devices, matches them against the database and connects to all of them automatically
 - The top bar sets the cards per row (2–5) and the presentation orientation (portrait/landscape — applied client-side, the video itself follows the device)
 - Settings persist in `%AppData%\ScrcpyNet\settings.json`; a lightweight diagnostic log is written to `%AppData%\ScrcpyNet\debug.log`
 

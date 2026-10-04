@@ -19,7 +19,41 @@
     <Window.Resources>
         <s:Boolean x:Key="True">True</s:Boolean>
         <local:IntegerValueConverter x:Key="IntegerValueConverter"/>
-        <local:VisibilityValueConverter x:Key="VisibilityValueConverter"/>
+        <local:VisibilityValueConverter x:Key="VisibilityConverter"/>
+
+        <!-- Text button for the settings bar (the global Button style is icon-only). -->
+        <Style x:Key="Button.BarAction" TargetType="Button">
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Foreground" Value="{StaticResource Brush.Accent}"/>
+            <Setter Property="Background" Value="{StaticResource Brush.AccentSoft}"/>
+            <Setter Property="Padding" Value="12,0"/>
+            <Setter Property="Height" Value="30"/>
+            <Setter Property="Width" Value="Auto"/>
+            <Setter Property="Margin" Value="8,0,0,0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd" Background="{TemplateBinding Background}"
+                                CornerRadius="8">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
+                                              Margin="{TemplateBinding Padding}"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="{StaticResource Brush.Accent}"/>
+                                <Setter Property="Foreground" Value="#FFFFFF"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#1D4ED8"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
     </Window.Resources>
 
     <Grid>
@@ -78,6 +112,18 @@
                     <ComboBoxItem Tag="{x:Static vm:DeviceOrientationOption.Portrait}" Content="竖屏"/>
                     <ComboBoxItem Tag="{x:Static vm:DeviceOrientationOption.Landscape}" Content="横屏"/>
                 </ComboBox>
+
+                <!-- Device management (SQLite-backed device registry) -->
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="20,0,0,0">
+                    <TextBlock Text="&#xE713;" FontFamily="Segoe MDL2 Assets" FontSize="14"
+                               Foreground="{StaticResource Brush.TextSecondary}"
+                               VerticalAlignment="Center"/>
+                    <TextBlock Text="设备管理" FontSize="12" FontWeight="SemiBold"
+                               Foreground="{StaticResource Brush.TextPrimary}"
+                               VerticalAlignment="Center" Margin="8,0,4,0"/>
+                    <Button Content="&#xE710; 添加设备" Style="{StaticResource Button.BarAction}"
+                            Command="{Binding AddDeviceCommand}" ToolTip="将设备序列号和名称注册到数据库"/>
+                </StackPanel>
             </StackPanel>
         </Border>
 

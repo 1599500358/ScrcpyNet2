@@ -12,7 +12,7 @@
 |---|---|
 | `ScrcpyNet` | 核心库：scrcpy-server 4.1 协议、H.264 视频解码、控制消息 |
 | `ScrcpyNet.Wpf` | WPF `ScrcpyDisplay` 控件：实时画面，支持自动旋转与设备真实宽高比 |
-| `ScrcpyNet.Sample.Wpf` | **群控应用**：自动连接 `Devices.txt` 中列出的所有设备，以卡片网格（每行 2–5 个）实时显示 |
+| `ScrcpyNet.Sample.Wpf` | **群控应用**：自动连接 SQLite 设备数据库中登记的所有设备，以卡片网格（每行 2–5 个）实时显示 |
 
 ## 功能特性
 
@@ -94,8 +94,10 @@ protected override void OnClosing(CancelEventArgs e)
 
 `ScrcpyNet.Sample.Wpf` 是一个开箱即用的群控工具：
 
-- 在可执行文件旁边的 `Devices.txt` 里列出设备，每行一条：`<序列号> <名称>`
-- 启动时自动枚举 adb 设备，与 `Devices.txt` 匹配后全部自动连接
+- 设备通过 SQLite 数据库管理：`%AppData%\ScrcpyNet\devices.db`（每台设备一条：序列号 + 自定义名称，名称显示为卡片标题）
+- 直接在应用内管理设备列表：顶栏 **添加设备** 登记新设备，卡片上的重命名/删除按钮可随时修改或移除——不再需要手动编辑文本文件
+- 首次运行时会自动把可执行文件旁的旧版 `Devices.txt`（每行 `<序列号> <名称>`）一次性导入数据库，之后该 txt 文件不再被读取
+- 启动时自动枚举 adb 设备，与数据库匹配后全部自动连接
 - 顶栏可设置每行卡片数（2–5）和呈现方向（竖屏/横屏——仅客户端旋转显示，视频本身跟随设备）
 - 设置持久化在 `%AppData%\ScrcpyNet\settings.json`；轻量诊断日志写入 `%AppData%\ScrcpyNet\debug.log`
 

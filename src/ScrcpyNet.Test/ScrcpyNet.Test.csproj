@@ -19,6 +19,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\ScrcpyNet\ScrcpyNet.csproj" />
+    <ProjectReference Include="..\ScrcpyNet.Sample.ViewModels\ScrcpyNet.Sample.ViewModels.csproj" />
   </ItemGroup>
 
 </Project>

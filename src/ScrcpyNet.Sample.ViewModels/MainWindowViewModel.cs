@@ -1,4 +1,5 @@
 using DynamicData.Binding;
+using ReactiveUI;
 using ReactiveUI.Reactive;
 using Serilog;
 using SharpAdbClient;
@@ -16,16 +17,30 @@ namespace ScrcpyNet.Sample.ViewModels
     public partial class MainWindowViewModel : ViewModelBase
     {
         public ReactiveCommand<Unit, List<ScrcpyViewModel>> LoadAvailableDevicesCommand { get; }
+        public ReactiveCommand<Unit, Unit> AddDeviceCommand { get; }
+
+        /// <summary>Ask the view for a new device (serial + name); null output = cancelled.</summary>
+        public Interaction<Unit, DeviceRecord?> AddDeviceInteraction { get; } = new();
+
+        /// <summary>Ask the view for a new name; input is the current name, null output = cancelled.</summary>
+        public Interaction<string, string?> RenameDeviceInteraction { get; } = new();
+
+        /// <summary>Ask the view to confirm removal; input is the device name.</summary>
+        public Interaction<string, bool> RemoveDeviceInteraction { get; } = new();
 
         public ObservableCollectionExtended<ScrcpyViewModel> Scrcpys { get; } = new ObservableCollectionExtended<ScrcpyViewModel>();
 
         /// <summary>Global UI settings shown in the top bar (persisted across restarts).</summary>
         public AppSettings Settings => AppSettings.Instance;
 
+        /// <summary>Device registry persisted in SQLite (replaces the old Devices.txt).</summary>
+        public DeviceDatabase DeviceDatabase { get; }
+
         private static readonly ILogger log = Log.ForContext<MainWindowViewModel>();
 
         public MainWindowViewModel()
         {
+            DeviceDatabase = DeviceDatabase.Default;
             LoadAvailableDevicesCommand = ReactiveCommand.Create(LoadAvailableDevices);
             // The command delivers its result on the taskpool, hop back to the UI thread
             // before touching the ObservableCollection.
@@ -33,6 +48,12 @@ namespace ScrcpyNet.Sample.ViewModels
                 .ObserveOn(RxSchedulers.MainThreadScheduler)
                 .Subscribe(devices =>
             {
+                // The load is a full replace: on reloads (e.g. after adding a device)
+                // the old cards are shut down and dropped first.
+                foreach (var old in Scrcpys)
+                    old.Shutdown();
+                Scrcpys.Clear();
+
                 foreach (var item in devices)
                 {
                     Scrcpys.Add(item);
@@ -40,6 +61,9 @@ namespace ScrcpyNet.Sample.ViewModels
                     item.ConnectCommand.Execute().Subscribe();
                 }
             });
+            AddDeviceCommand = ReactiveCommand.CreateFromTask(AddDevice);
+            AddDeviceCommand.ThrownExceptions.Subscribe(ex => log.Error(ex, "AddDevice failed"));
+
             Task.Run(async () =>
             {
                 // Start ADB server if needed
@@ -65,36 +89,48 @@ namespace ScrcpyNet.Sample.ViewModels
             });
         }
 
+        private async Task AddDevice()
+        {
+            DeviceRecord? record = await AddDeviceInteraction.Handle(new Unit());
+            if (record == null || string.IsNullOrWhiteSpace(record.Serial))
+                return;
+
+            if (!DeviceDatabase.Add(record.Serial, record.Name))
+            {
+                UiDiagnostics.Log($"AddDevice: serial '{record.Serial}' is already registered");
+                return;
+            }
+            UiDiagnostics.Log($"AddDevice: registered '{record.Serial}' as '{record.Name}'");
+
+            // Re-run the load so the new device gets a card (when adb sees it).
+            await LoadAvailableDevicesCommand.Execute();
+        }
+
+        /// <summary>Drops a card from the layout (the device was removed from the database).</summary>
+        internal void RemoveCard(ScrcpyViewModel item)
+        {
+            item.Shutdown();
+            Scrcpys.Remove(item);
+        }
+
         private List<ScrcpyViewModel> LoadAvailableDevices()
         {
             try
             {
                 var port = 27183;
-                // Resolve Devices.txt relative to the exe first — the process working
-                // directory is unpredictable when the app is launched from elsewhere.
-                string filePath = Path.Combine(AppContext.BaseDirectory, "Devices.txt");
-                if (!File.Exists(filePath))
-                    filePath = "Devices.txt";
-                FileReader fileReader = new FileReader();
-                List<string[]> lines = fileReader.ReadFile(filePath);
+                List<DeviceRecord> records = DeviceDatabase.GetAll();
                 var devices = new AdbClient().GetDevices();
-                UiDiagnostics.Log($"LoadAvailableDevices: Devices.txt='{filePath}' entries={lines.Count}, adb devices={devices.Count}");
+                UiDiagnostics.Log($"LoadAvailableDevices: db='{DeviceDatabase.DatabasePath}' entries={records.Count}, adb devices={devices.Count}");
                 List<ScrcpyViewModel> list = new List<ScrcpyViewModel>();
-                foreach (var line in lines)
+                foreach (var record in records)
                 {
-                    if (line.Length >= 2)
+                    var deviceToUpdate = devices.FirstOrDefault(d => d.Serial == record.Serial);
+                    if (deviceToUpdate != null)
                     {
-                        var Serial = line[0];
-                        var newName = line[1];
-
-                        var deviceToUpdate = devices.FirstOrDefault(d => d.Serial == Serial);
-                        if (deviceToUpdate != null)
-                        {
-                            deviceToUpdate.Name = newName;
-                            var scrcpyvm = new ScrcpyViewModel(deviceToUpdate,port);
-                            list.Add(scrcpyvm);
-                            port++;
-                        }
+                        deviceToUpdate.Name = record.Name;
+                        var scrcpyvm = new ScrcpyViewModel(deviceToUpdate, port, record.Name, this);
+                        list.Add(scrcpyvm);
+                        port++;
                     }
                 }
                 UiDiagnostics.Log($"LoadAvailableDevices: matched {list.Count} device(s)");

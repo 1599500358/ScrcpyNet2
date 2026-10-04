@@ -18,23 +18,36 @@ namespace ScrcpyNet.Sample.ViewModels
         int port;
         [Reactive] public partial bool IsConnected { get; private set; }
         [Reactive] public partial bool IsConnecting { get; private set; }
+        /// <summary>User-assigned device name from the database, shown as the card title.</summary>
         [Reactive] public partial string DeviceName { get; private set; }
+        /// <summary>Device model reported by scrcpy once connected (e.g. SM-G965U1).</summary>
+        [Reactive] public partial string? DeviceModel { get; private set; }
         [Reactive] public partial Scrcpy? Scrcpy { get; private set; }
 
         public ReactiveCommand<Unit, Unit> ConnectCommand { get; }
         public ReactiveCommand<Unit, Unit> DisconnectCommand { get; }
+        public ReactiveCommand<Unit, Unit> RenameDeviceCommand { get; }
+        public ReactiveCommand<Unit, Unit> RemoveDeviceCommand { get; }
 
         public ReactiveCommand<AndroidKeycode, Unit> SendKeycodeCommand { get; }
 
         /// <summary>Serializes connect attempts against disconnects and orientation restarts.</summary>
         private readonly SemaphoreSlim connectLock = new(1, 1);
 
-        public ScrcpyViewModel(DeviceData d,int p)
+        private readonly MainWindowViewModel owner;
+
+        /// <summary>The adb serial of this device (primary key in the device database).</summary>
+        public string Serial => device.Serial;
+
+        public ScrcpyViewModel(DeviceData d, int p, string name, MainWindowViewModel owner)
         {
-            port= p;
+            port = p;
             device = d;
+            this.owner = owner;
             BitrateKb = 1_000;
-            DeviceName = "";
+            // The card shows the database name immediately, before any connection;
+            // DeviceModel is filled in separately once scrcpy reports it.
+            DeviceName = name;
             // Block the command while a connection exists or is being established, so the
             // button shows as disabled and double clicks are ignored.
             var canConnect = this.WhenAnyValue(
@@ -45,13 +58,55 @@ namespace ScrcpyNet.Sample.ViewModels
             DisconnectCommand = ReactiveCommand.Create(Disconnect, this.WhenAnyValue(x => x.IsConnected));
             SendKeycodeCommand = ReactiveCommand.Create<AndroidKeycode>(SendKeycode);
 
+            // Renaming/removing rewrites the database and (for remove) the card list;
+            // block both while a connect attempt is in flight to avoid racing it.
+            var canEdit = this.WhenAnyValue(x => x.IsConnecting, connecting => !connecting);
+            RenameDeviceCommand = ReactiveCommand.CreateFromTask(RenameDevice, canEdit);
+            RemoveDeviceCommand = ReactiveCommand.CreateFromTask(RemoveDevice, canEdit);
+
             // Log command errors instead of letting them surface as unhandled.
             ConnectCommand.ThrownExceptions.Subscribe(ex => Log.Error(ex, "Connect failed for {Serial}", device.Serial));
             DisconnectCommand.ThrownExceptions.Subscribe(ex => Log.Error(ex, "Disconnect failed for {Serial}", device.Serial));
             SendKeycodeCommand.ThrownExceptions.Subscribe(ex => Log.Error(ex, "SendKeycode failed for {Serial}", device.Serial));
+            RenameDeviceCommand.ThrownExceptions.Subscribe(ex => Log.Error(ex, "RenameDevice failed for {Serial}", device.Serial));
+            RemoveDeviceCommand.ThrownExceptions.Subscribe(ex => Log.Error(ex, "RemoveDevice failed for {Serial}", device.Serial));
 
             // The orientation setting is display-only (client-side video rotation), so
             // there is nothing to push to the device here — the UI handles it.
+        }
+
+        /// <summary>Stops the mirror (if any) without touching the database or the card list.</summary>
+        public void Shutdown()
+        {
+            Scrcpy?.Stop();
+            Scrcpy = null;
+            IsConnected = false;
+        }
+
+        private async Task RenameDevice()
+        {
+            // The dialog handler is registered by MainWindow; null means cancelled.
+            string? newName = await owner.RenameDeviceInteraction.Handle(DeviceName);
+            if (string.IsNullOrWhiteSpace(newName))
+                return;
+
+            if (owner.DeviceDatabase.Rename(Serial, newName))
+            {
+                DeviceName = newName.Trim();
+                UiDiagnostics.Log($"Renamed device '{Serial}' to '{DeviceName}'");
+            }
+        }
+
+        private async Task RemoveDevice()
+        {
+            bool confirmed = await owner.RemoveDeviceInteraction.Handle(DeviceName);
+            if (!confirmed)
+                return;
+
+            owner.DeviceDatabase.Remove(Serial);
+            Shutdown();
+            owner.RemoveCard(this);
+            UiDiagnostics.Log($"Removed device '{Serial}' from the database");
         }
 
         private async Task Connect()
@@ -88,7 +143,7 @@ namespace ScrcpyNet.Sample.ViewModels
                     };
 
                     Scrcpy = scrcpy;
-                    DeviceName = scrcpy.DeviceName;
+                    DeviceModel = scrcpy.DeviceName;
                     IsConnected = true;
                 }
                 catch (Exception ex)
