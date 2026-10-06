@@ -144,7 +144,7 @@ namespace ScrcpyNet
             if (_frame == null) throw new Exception("Couldn't allocate AVFrame.");
 
             packet = ffmpeg.av_packet_alloc();
-            if (_frame == null) throw new Exception("Couldn't allocate AVPacket.");
+            if (packet == null) throw new Exception("Couldn't allocate AVPacket.");
         }
 
         ~VideoStreamDecoder()
@@ -176,33 +176,24 @@ namespace ScrcpyNet
             HWtype = AVHWDeviceType.AV_HWDEVICE_TYPE_NONE;
             var availableHWDecoders = new Dictionary<int, AVHWDeviceType>();
 
-       
-                Console.WriteLine("Select hardware decoder:");
-                var type = AVHWDeviceType.AV_HWDEVICE_TYPE_NONE;
-                var number = 0;
+            var type = AVHWDeviceType.AV_HWDEVICE_TYPE_NONE;
+            var number = 0;
+            while ((type = ffmpeg.av_hwdevice_iterate_types(type)) != AVHWDeviceType.AV_HWDEVICE_TYPE_NONE)
+                availableHWDecoders.Add(++number, type);
 
-                while ((type = ffmpeg.av_hwdevice_iterate_types(type)) != AVHWDeviceType.AV_HWDEVICE_TYPE_NONE)
-                {
-                    Console.WriteLine($"{++number}. {type}");
-                    availableHWDecoders.Add(number, type);
-                }
+            if (availableHWDecoders.Count == 0)
+            {
+                log.Information("No hardware decoder available, using software decoding.");
+                return;
+            }
 
-                if (availableHWDecoders.Count == 0)
-                {
-                    Console.WriteLine("Your system have no hardware decoders.");
-                    HWtype = AVHWDeviceType.AV_HWDEVICE_TYPE_NONE;
-                    return;
-                }
-
-                var decoderNumber = availableHWDecoders
-                    .SingleOrDefault(t => t.Value == AVHWDeviceType.AV_HWDEVICE_TYPE_DXVA2).Key;
-                if (decoderNumber == 0)
-                    decoderNumber = availableHWDecoders.First().Key;
-                Console.WriteLine($"Selected [{decoderNumber}]");
-                //int.TryParse(Console.ReadLine(), out var inputDecoderNumber);
-                availableHWDecoders.TryGetValue(decoderNumber,
-                    out HWtype);
-            
+            // Prefer DXVA2 (transfers to system memory reliably on Windows), fall
+            // back to whatever the platform offers first.
+            HWtype = availableHWDecoders.Values.Contains(AVHWDeviceType.AV_HWDEVICE_TYPE_DXVA2)
+                ? AVHWDeviceType.AV_HWDEVICE_TYPE_DXVA2
+                : availableHWDecoders.First().Value;
+            log.Information("Hardware decoders available: {Candidates}; selected {Selected}.",
+                string.Join(", ", availableHWDecoders.Values), HWtype);
         }
 
         public void Decode(byte[] data, long pts = -1)
@@ -317,14 +308,12 @@ namespace ScrcpyNet
                         // Poor man's reference counting.
                         lock (lastFrameLock)
                         {
-                            //if (lastFrame != null && Interlocked.Read(ref lastFrameRefCount) == 0)
                             if (lastFrame != null && lastFrameRefCount == 0)
                             {
                                 // We don't have to dispose it, but then the GC will remove all old frames after 'some time'.
                                 // On my 32GB RAM computer the GC allowed the app to use up to 8GB before cleaning it up.
                                 lastFrame.Dispose();
                             }
-                            //Interlocked.Exchange(ref lastFrameRefCount, 0);
                             lastFrameRefCount = 0;
                         }
 
@@ -332,13 +321,12 @@ namespace ScrcpyNet
                         lastFrame = new FrameData(destBufferPtr, destSize, frame.width, frame.height, ctx->frame_num, AVPixelFormat.AV_PIX_FMT_BGRA);
                         OnFrame?.Invoke(this, lastFrame);
                     }
-                    //else
-                    //{
-                    //    log.Warning("outputSliceHeight == 0, not sure if this is bad?");
-
-                    //    // Manually free the destBufferPtr when we don't create a FrameData object.
-                    //    ffmpeg.av_free(destBufferPtr);
-                    //}
+                    else
+                    {
+                        // No FrameData took ownership of the buffer — free it here,
+                        // otherwise it leaks (av_malloc'd memory is invisible to the GC).
+                        ffmpeg.av_free(destBufferPtr);
+                    }
                 }
             }
         }
@@ -347,12 +335,8 @@ namespace ScrcpyNet
         {
             if (!disposed)
             {
-                if (disposing)
-                {
-                    // Dispose managed state (managed objects)
-                }
-
-                // Free unmanaged resources (unmanaged objects) and override finalizer
+                // Free unmanaged resources. ffmpeg's free functions tolerate the null
+                // pointers that remain when the constructor threw partway through.
                 ffmpeg.av_parser_close(parser);
                 ffmpeg.sws_freeContext(swsContext);
 
@@ -360,6 +344,9 @@ namespace ScrcpyNet
                     ffmpeg.avcodec_free_context(ptr);
 
                 fixed (AVFrame** ptr = &_frame)
+                    ffmpeg.av_frame_free(ptr);
+
+                fixed (AVFrame** ptr = &_receivedFrame)
                     ffmpeg.av_frame_free(ptr);
 
                 fixed (AVPacket** ptr = &packet)

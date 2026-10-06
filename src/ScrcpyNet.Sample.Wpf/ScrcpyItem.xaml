@@ -32,8 +32,11 @@
                 <RowDefinition Height="52"/>
             </Grid.RowDefinitions>
 
-            <!-- ============  Header: status dot + device name + status  ============ -->
-            <Grid Grid.Row="0" Margin="16,0">
+            <!-- ============  Header: status dot + device name + status  ============
+                 Also the drag handle for manual card ordering (MainWindow drag &
+                 drop handlers via ScrcpyItem.DragHandle). -->
+            <Grid x:Name="CardHeader" Grid.Row="0" Margin="16,0"
+                  Cursor="SizeAll" ToolTip="拖动排序">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="*"/>
@@ -42,10 +45,36 @@
 
                 <Ellipse Grid.Column="0" Style="{StaticResource Shape.StatusDot}" Margin="0,0,10,0"/>
 
-                <TextBlock Grid.Column="1"
-                           Text="{Binding DeviceName, FallbackValue=等待设备…}"
-                           ToolTip="{Binding Serial, StringFormat='序列号: {0}'}"
-                           Style="{StaticResource Text.CardTitle}"/>
+                <!-- Name + copy button hug each other; MaxWidth keeps the ellipsis
+                     working for long names even though a StackPanel measures to infinity. -->
+                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                    <TextBlock Text="{Binding DeviceName, FallbackValue=等待设备…}"
+                               MaxWidth="220"
+                               ToolTip="{Binding Serial, StringFormat='序列号: {0}'}"
+                               Style="{StaticResource Text.CardTitle}"/>
+                    <!-- Copy: copies the adb serial, glyph flashes to a checkmark (code-behind) -->
+                    <Button Content="&#xE8C8;" Width="22" Height="22" Margin="4,0,0,0"
+                            FontSize="11" VerticalAlignment="Center"
+                            ToolTip="复制ADB编号" Click="CopySerial_Click"/>
+                    <!-- Unregistered device (seen on adb, not in the database); hides
+                         once the user names the card, which registers it. -->
+                    <Border Margin="6,0,0,0" VerticalAlignment="Center" CornerRadius="4"
+                            Background="{StaticResource Brush.IconBtnHover}" Padding="6,2"
+                            ToolTip="设备不在数据库中，重命名即可登记">
+                        <Border.Style>
+                            <Style TargetType="Border">
+                                <Setter Property="Visibility" Value="Collapsed"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsRegistered}" Value="False">
+                                        <Setter Property="Visibility" Value="Visible"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+                        <TextBlock Text="未注册" FontSize="10"
+                                   Foreground="{StaticResource Brush.TextSecondary}"/>
+                    </Border>
+                </StackPanel>
 
                 <TextBlock Grid.Column="2" Style="{StaticResource Text.Status}"/>
             </Grid>

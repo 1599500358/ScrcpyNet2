@@ -14,7 +14,7 @@ using System.Threading.Channels;
 
 namespace ScrcpyNet
 {
-    public class Scrcpy
+    public class Scrcpy : IDisposable
     {
         /// <summary>
         /// scrcpy-server version this client implements. The server refuses to start when the
@@ -31,6 +31,9 @@ namespace ScrcpyNet
 
         int port;
         public string DeviceName { get; private set; } = ""; // 设备名称
+        // Written by the video thread (decoder), read by the UI. Plain ints are atomic
+        // and the pair is only ever consumed directionally (aspect ratio), so no lock;
+        // a torn w/h mix can only appear for one frame during a physical rotation.
         public int Width { get; internal set; } // 屏幕宽度
         public int Height { get; internal set; } // 屏幕高度
         public long Bitrate { get; set; } = 200000; // 视频流比特率（bit/s）
@@ -87,13 +90,15 @@ namespace ScrcpyNet
         /// <summary>
         /// 启动Scrcpy服务
         /// </summary>
-        /// <param name="timeoutMs">超时时间（毫秒）</param>
-        public void Start(long timeoutMs = 5000)
+        /// <param name="timeoutMs">超时时间（毫秒）。默认 15 秒：握手热态约 4.5 秒，
+        /// 但从休眠唤醒的设备（CPU 降频、doze）需要明显更久，5 秒会误判失败。</param>
+        public void Start(long timeoutMs = 15000)
         {
             if (Connected)
                 throw new Exception("Already connected.");
 
             Interlocked.Exchange(ref streamEndedHandled, 0);
+            Interlocked.Exchange(ref controlGoneLogged, 0);
 
             try
             {
@@ -145,7 +150,7 @@ namespace ScrcpyNet
                 listener.Stop();
                 listener = null;
 
-                ReadDeviceInfo();
+                ReadDeviceInfo(timeoutMs);
 
                 cts = new CancellationTokenSource();
 
@@ -209,21 +214,41 @@ namespace ScrcpyNet
         }
 
         /// <summary>
+        /// 停止会话（若在进行中）并释放视频解码器的非托管资源。断开后应及时调用：
+        /// 否则解码器只能靠 GC 终结器回收 FFmpeg 上下文（见 VideoStreamDecoder）。
+        /// </summary>
+        public void Dispose()
+        {
+            Stop();
+            VideoStreamDecoder.Dispose();
+        }
+
+        /// <summary>Guards so the "control socket is gone" warning is logged only once per session.</summary>
+        private int controlGoneLogged;
+
+        /// <summary>
         /// 发送控制命令
         /// </summary>
         /// <param name="msg">控制消息</param>
         public void SendControlCommand(IControlMessage msg)
         {
             if (controlClient == null)
-                log.Warning("SendControlCommand() called, but controlClient is null.");
-            else
-                controlChannel.Writer.TryWrite(msg);
+            {
+                // The UI keeps sending input while a session is down; warn once
+                // instead of flooding the log with every mouse move.
+                if (Interlocked.Exchange(ref controlGoneLogged, 1) == 0)
+                    log.Warning("SendControlCommand() called, but controlClient is null (further calls stay silent).");
+                return;
+            }
+
+            controlChannel.Writer.TryWrite(msg);
         }
 
         /// <summary>
         /// 读取设备信息：64字节设备名 + 4字节编码器ID + 12字节会话元数据（视频尺寸）
         /// </summary>
-        private void ReadDeviceInfo()
+        /// <param name="timeoutMs">读取预算，与 Start 的连接超时一致（唤醒中的设备第一包可能很慢）</param>
+        private void ReadDeviceInfo(long timeoutMs)
         {
             // 检查videoClient是否为空
             if (videoClient == null)
@@ -231,7 +256,7 @@ namespace ScrcpyNet
 
             // 获取视频流的网络流
             var infoStream = videoClient.GetStream();
-            infoStream.ReadTimeout = 2000;
+            infoStream.ReadTimeout = (int)Math.Clamp(timeoutMs, 2000, int.MaxValue);
 
             // 64字节设备名（send_device_meta=true）
             var nameBuf = new byte[64];
@@ -485,6 +510,13 @@ namespace ScrcpyNet
                 // Socket gone (Stop() ran or the device disconnected); drop the message.
                 log.Information("Control message dropped, socket closed: {Message}", ex.Message);
             }
+            catch (Exception ex)
+            {
+                // A message that fails to serialize (e.g. text over 300 UTF-8 bytes,
+                // scroll values out of range) must not kill the control loop — that
+                // would silently swallow every later command of the whole session.
+                log.Error(ex, "Dropping a control message that failed to serialize or send.");
+            }
         }
 
         /// <summary>
@@ -523,9 +555,10 @@ namespace ScrcpyNet
         /// </summary>
         private void MobileServerCleanup()
         {
-            // Remove any existing network stuff.
-            adb.RemoveAllForwards(device);
-            adb.RemoveAllReverseForwards(device);
+            // Remove only OUR tunnel: the blanket RemoveAll*(device) variants would
+            // also tear down unrelated adb rules other tools installed on the device.
+            // We never create forwards (tunnel_forward=false), so nothing to remove there.
+            adb.RemoveReverseForward(device, "localabstract:scrcpy");
         }
 
         /// <summary>

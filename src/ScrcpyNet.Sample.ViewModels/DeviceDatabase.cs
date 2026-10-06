@@ -54,12 +54,24 @@ namespace ScrcpyNet.Sample.ViewModels
             using (var connection = Open())
             using (var command = connection.CreateCommand())
             {
-                // rowid is implicit and keeps insertion order for GetAll().
+                // rowid is implicit; sort_order carries the manual card order
+                // (drag & drop) and is initialized from rowid so the first run
+                // after the migration shows the same order as before.
                 command.CommandText =
                     "CREATE TABLE IF NOT EXISTS devices (" +
                     "serial TEXT PRIMARY KEY NOT NULL, " +
                     "name  TEXT NOT NULL)";
                 command.ExecuteNonQuery();
+
+                // Databases created before manual ordering existed lack the
+                // column; add it and backfill from rowid (= insertion order).
+                if (!HasColumn(connection, "sort_order"))
+                {
+                    command.CommandText = "ALTER TABLE devices ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0";
+                    command.ExecuteNonQuery();
+                    command.CommandText = "UPDATE devices SET sort_order = rowid";
+                    command.ExecuteNonQuery();
+                }
             }
 
             if (firstRun)
@@ -86,13 +98,13 @@ namespace ScrcpyNet.Sample.ViewModels
             }
         }
 
-        /// <summary>All devices in insertion order.</summary>
+        /// <summary>All devices in manual order (drag & drop; insertion order until reordered).</summary>
         public List<DeviceRecord> GetAll()
         {
             var result = new List<DeviceRecord>();
             using var connection = Open();
             using var command = connection.CreateCommand();
-            command.CommandText = "SELECT serial, name FROM devices ORDER BY rowid";
+            command.CommandText = "SELECT serial, name FROM devices ORDER BY sort_order, rowid";
             using var reader = command.ExecuteReader();
             while (reader.Read())
                 result.Add(new DeviceRecord(reader.GetString(0), reader.GetString(1)));
@@ -109,7 +121,8 @@ namespace ScrcpyNet.Sample.ViewModels
             return reader.Read() ? new DeviceRecord(reader.GetString(0), reader.GetString(1)) : null;
         }
 
-        /// <summary>Registers a device. Returns false (and changes nothing) if the serial already exists.</summary>
+        /// <summary>Registers a device at the end of the manual order. Returns
+        /// false (and changes nothing) if the serial already exists.</summary>
         public bool Add(string serial, string name)
         {
             serial = serial.Trim();
@@ -118,11 +131,57 @@ namespace ScrcpyNet.Sample.ViewModels
                 throw new ArgumentException("Serial must not be empty.", nameof(serial));
 
             using var connection = Open();
+            long nextOrder = NextSortOrder(connection);
             using var command = connection.CreateCommand();
-            command.CommandText = "INSERT OR IGNORE INTO devices (serial, name) VALUES ($serial, $name)";
+            command.CommandText = "INSERT OR IGNORE INTO devices (serial, name, sort_order) VALUES ($serial, $name, $order)";
             command.Parameters.AddWithValue("$serial", serial);
             command.Parameters.AddWithValue("$name", name);
+            command.Parameters.AddWithValue("$order", nextOrder);
             return command.ExecuteNonQuery() == 1;
+        }
+
+        /// <summary>Rewrites the manual order: serials are numbered front to back
+        /// in the order given. Serials not registered (unregistered cards) are
+        /// skipped; every registered serial should appear exactly once.</summary>
+        public void Reorder(IEnumerable<string> serialsInOrder)
+        {
+            using var connection = Open();
+            using var transaction = connection.BeginTransaction();
+            using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE devices SET sort_order = $order WHERE serial = $serial";
+            var orderParam = command.CreateParameter();
+            orderParam.ParameterName = "$order";
+            var serialParam = command.CreateParameter();
+            serialParam.ParameterName = "$serial";
+            command.Parameters.Add(orderParam);
+            command.Parameters.Add(serialParam);
+
+            long order = 1;
+            foreach (var serial in serialsInOrder)
+            {
+                orderParam.Value = order++;
+                serialParam.Value = serial.Trim();
+                command.ExecuteNonQuery();
+            }
+            transaction.Commit();
+        }
+
+        private static long NextSortOrder(SqliteConnection connection)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM devices";
+            return Convert.ToInt64(command.ExecuteScalar());
+        }
+
+        private static bool HasColumn(SqliteConnection connection, string column)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = "PRAGMA table_info(devices)";
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+                if (reader.GetString(1) == column)
+                    return true;
+            return false;
         }
 
         /// <summary>Renames a device. Returns false when the serial is unknown or the name is unchanged.</summary>

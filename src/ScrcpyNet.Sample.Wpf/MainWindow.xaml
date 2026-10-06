@@ -127,10 +127,18 @@
             </StackPanel>
         </Border>
 
-        <!-- ============  Device cards  ============ -->
+        <!-- ============  Device cards  ============
+             Cards can be reordered manually: drag by the card header (see
+             ScrcpyItem.DragHandle) and drop on any card — before its top half,
+             after its bottom half. The order persists to devices.db. -->
         <ListBox Grid.Row="2" ItemsSource="{Binding Scrcpys}"
                  Background="Transparent" BorderThickness="0"
                  HorizontalContentAlignment="Stretch"
+                 AllowDrop="True"
+                 PreviewMouseLeftButtonDown="Cards_PreviewMouseLeftButtonDown"
+                 PreviewMouseMove="Cards_PreviewMouseMove"
+                 DragOver="Cards_DragOver"
+                 Drop="Cards_Drop"
                  ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                  ScrollViewer.VerticalScrollBarVisibility="Auto">
             <ListBox.ItemTemplate>

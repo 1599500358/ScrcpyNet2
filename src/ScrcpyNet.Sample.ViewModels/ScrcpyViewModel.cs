@@ -18,6 +18,11 @@ namespace ScrcpyNet.Sample.ViewModels
         int port;
         [Reactive] public partial bool IsConnected { get; private set; }
         [Reactive] public partial bool IsConnecting { get; private set; }
+        /// <summary>Whether the serial exists in the device database. Unregistered
+        /// devices (seen on adb but never named by the user) get a card too, shown
+        /// after the registered ones, and are never auto-connected; renaming one
+        /// registers it on the spot.</summary>
+        [Reactive] public partial bool IsRegistered { get; private set; }
         /// <summary>User-assigned device name from the database, shown as the card title.</summary>
         [Reactive] public partial string DeviceName { get; private set; }
         /// <summary>Device model reported by scrcpy once connected (e.g. SM-G965U1).</summary>
@@ -39,14 +44,16 @@ namespace ScrcpyNet.Sample.ViewModels
         /// <summary>The adb serial of this device (primary key in the device database).</summary>
         public string Serial => device.Serial;
 
-        public ScrcpyViewModel(DeviceData d, int p, string name, MainWindowViewModel owner)
+        public ScrcpyViewModel(DeviceData d, int p, string name, bool isRegistered, MainWindowViewModel owner)
         {
             port = p;
             device = d;
             this.owner = owner;
             BitrateKb = 1_000;
             // The card shows the database name immediately, before any connection;
-            // DeviceModel is filled in separately once scrcpy reports it.
+            // DeviceModel is filled in separately once scrcpy reports it. For
+            // unregistered devices the name falls back to the serial.
+            IsRegistered = isRegistered;
             DeviceName = name;
             // Block the command while a connection exists or is being established, so the
             // button shows as disabled and double clicks are ignored.
@@ -78,7 +85,9 @@ namespace ScrcpyNet.Sample.ViewModels
         /// <summary>Stops the mirror (if any) without touching the database or the card list.</summary>
         public void Shutdown()
         {
-            Scrcpy?.Stop();
+            // Dispose (not just Stop): also releases the decoder's FFmpeg contexts
+            // instead of waiting for the GC finalizer to get around to it.
+            Scrcpy?.Dispose();
             Scrcpy = null;
             IsConnected = false;
         }
@@ -90,10 +99,25 @@ namespace ScrcpyNet.Sample.ViewModels
             if (string.IsNullOrWhiteSpace(newName))
                 return;
 
-            if (owner.DeviceDatabase.Rename(Serial, newName))
+            newName = newName.Trim();
+            if (IsRegistered)
             {
-                DeviceName = newName.Trim();
-                UiDiagnostics.Log($"Renamed device '{Serial}' to '{DeviceName}'");
+                if (owner.DeviceDatabase.Rename(Serial, newName))
+                {
+                    DeviceName = newName;
+                    UiDiagnostics.Log($"Renamed device '{Serial}' to '{DeviceName}'");
+                }
+            }
+            else
+            {
+                // Renaming an unregistered device registers it: the user naming the
+                // card IS the "yes, I want this device in my list" action.
+                if (owner.DeviceDatabase.Add(Serial, newName))
+                {
+                    IsRegistered = true;
+                    DeviceName = newName;
+                    UiDiagnostics.Log($"Registered device '{Serial}' as '{DeviceName}'");
+                }
             }
         }
 
@@ -120,9 +144,10 @@ namespace ScrcpyNet.Sample.ViewModels
                 if (Scrcpy != null) return;
 
                 IsConnecting = true;
+                Scrcpy? scrcpy = null;
                 try
                 {
-                    var scrcpy = new Scrcpy(device, port);
+                    scrcpy = new Scrcpy(device, port);
                     scrcpy.Bitrate = (long)(BitrateKb * 1000);
                     // SM-G965U1 (Android 10) only offers the default vendor OMX.qcom.video.encoder.avc
                     // and the software c2.android.avc.encoder for h264 — force the latter for this phone.
@@ -130,7 +155,7 @@ namespace ScrcpyNet.Sample.ViewModels
                         scrcpy.VideoEncoder = "c2.android.avc.encoder";
                     // The video always streams in the device's physical orientation; the
                     // rotation setting is applied client-side on the display only.
-                    await Task.Run(() => scrcpy.Start());
+                    await Task.Run(() => scrcpy!.Start());
 
                     // The device can vanish mid-session (USB unplug, server crash): reflect
                     // it in the UI. Fires on a threadpool thread; WPF marshals scalar
@@ -138,8 +163,15 @@ namespace ScrcpyNet.Sample.ViewModels
                     scrcpy.Disconnected += () =>
                     {
                         Log.Warning("Connection to {Serial} was lost.", device.Serial);
-                        IsConnected = false;
-                        Scrcpy = null;
+                        // Release the sockets and FFmpeg contexts promptly. Only clear the
+                        // card state when this session is still the current one — the user
+                        // may have reconnected before the event was delivered.
+                        scrcpy.Dispose();
+                        if (ReferenceEquals(Scrcpy, scrcpy))
+                        {
+                            IsConnected = false;
+                            Scrcpy = null;
+                        }
                     };
 
                     Scrcpy = scrcpy;
@@ -150,6 +182,8 @@ namespace ScrcpyNet.Sample.ViewModels
                 {
                     // Devices connect automatically on startup, so one failing device
                     // (offline, unauthorized, ...) must not take down the whole app.
+                    // Dispose releases a half-started session's sockets and decoder.
+                    scrcpy?.Dispose();
                     Log.Error(ex, "Couldn't connect to {Serial}", device.Serial);
                     IsConnected = false;
                 }
@@ -168,7 +202,7 @@ namespace ScrcpyNet.Sample.ViewModels
         {
             if (Scrcpy != null)
             {
-                Scrcpy.Stop();
+                Scrcpy.Dispose();
                 IsConnected = false;
                 Scrcpy = null;
             }

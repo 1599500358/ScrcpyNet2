@@ -2,6 +2,7 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
 using ScrcpyNet.Sample.ViewModels;
 using System;
 using System.IO;
+using System.Linq;
 using System.Text;
 
 namespace ScrcpyNet.Test
@@ -144,6 +145,67 @@ namespace ScrcpyNet.Test
             var all = db.GetAll();
             for (int i = 0; i < 5; i++)
                 Assert.AreEqual($"serial{i}", all[i].Serial);
+        }
+
+        [TestMethod]
+        public void Reorder_RewritesOrder_PersistedAcrossReopen()
+        {
+            var db = new DeviceDatabase(DbPath, Array.Empty<string>());
+            db.Add("serial1", "一");
+            db.Add("serial2", "二");
+            db.Add("serial3", "三");
+
+            db.Reorder(new[] { "serial3", "serial1", "serial2" });
+
+            var reopened = new DeviceDatabase(DbPath, Array.Empty<string>());
+            CollectionAssert.AreEqual(
+                new[] { "serial3", "serial1", "serial2" },
+                reopened.GetAll().Select(r => r.Serial).ToArray());
+        }
+
+        [TestMethod]
+        public void Reorder_SkipsUnknownSerials_AndLaterAddsGoLast()
+        {
+            var db = new DeviceDatabase(DbPath, Array.Empty<string>());
+            db.Add("serial1", "一");
+            db.Add("serial2", "二");
+
+            // Serials of unregistered cards match no row and must not shift positions.
+            db.Reorder(new[] { "serial2", "not-in-db", "serial1" });
+            db.Add("serial3", "三");
+
+            CollectionAssert.AreEqual(
+                new[] { "serial2", "serial1", "serial3" },
+                db.GetAll().Select(r => r.Serial).ToArray());
+        }
+
+        [TestMethod]
+        public void Migration_FromPreSortOrderDatabase_KeepsInsertionOrder()
+        {
+            // Simulate a database written by an app version before manual
+            // ordering existed (no sort_order column).
+            using (var raw = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={DbPath}"))
+            {
+                raw.Open();
+                using var cmd = raw.CreateCommand();
+                cmd.CommandText =
+                    "CREATE TABLE devices (serial TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL); " +
+                    "INSERT INTO devices (serial, name) VALUES ('s1','一'),('s2','二'),('s3','三');";
+                cmd.ExecuteNonQuery();
+            }
+
+            var db = new DeviceDatabase(DbPath, Array.Empty<string>());
+
+            CollectionAssert.AreEqual(
+                new[] { "s1", "s2", "s3" },
+                db.GetAll().Select(r => r.Serial).ToArray());
+
+            // The migrated database still accepts every registry operation.
+            Assert.IsTrue(db.Rename("s1", "改名"));
+            db.Reorder(new[] { "s3", "s1", "s2" });
+            CollectionAssert.AreEqual(
+                new[] { "s3", "s1", "s2" },
+                db.GetAll().Select(r => r.Serial).ToArray());
         }
     }
 }

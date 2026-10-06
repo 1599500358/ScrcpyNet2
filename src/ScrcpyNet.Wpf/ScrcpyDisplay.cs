@@ -187,6 +187,10 @@ namespace ScrcpyNet.Wpf
                 else if (e.LeftButton == MouseButtonState.Pressed)
                 {
                     e.Handled = true;
+                    // Capture so dragging out of the element keeps delivering MOVE and
+                    // (crucially) the final UP — otherwise the device would think the
+                    // finger is still pressed at the last position.
+                    CaptureMouse();
                     SendTouchCommand(AndroidMotionEventAction.AMOTION_EVENT_ACTION_DOWN, e);
                 }
             }
@@ -196,6 +200,9 @@ namespace ScrcpyNet.Wpf
 
         protected override void OnMouseUp(MouseButtonEventArgs e)
         {
+            if (IsMouseCaptured)
+                ReleaseMouseCapture();
+
             if (Scrcpy != null)
             {
                 e.Handled = true;
@@ -228,6 +235,7 @@ namespace ScrcpyNet.Wpf
                 e.Handled = true;
 
                 var msg = new KeycodeControlMessage();
+                msg.Action = AndroidKeyEventAction.AKEY_EVENT_ACTION_DOWN;
                 msg.KeyCode = KeycodeHelper.ConvertKey(e.Key);
                 msg.Metastate = KeycodeHelper.ConvertModifiers(e.KeyboardDevice.Modifiers);
                 Scrcpy.SendControlCommand(msg);
@@ -293,9 +301,10 @@ namespace ScrcpyNet.Wpf
             pos.Point = new Point { X = (int)point.X, Y = (int)point.Y };
             pos.ScreenSize.Width = (ushort)renderTarget.ActualWidth;
             pos.ScreenSize.Height = (ushort)renderTarget.ActualHeight;
-            TouchHelper.ScaleToScreenSize(pos, Scrcpy.Width, Scrcpy.Height);
-
-            return pos;
+            // Null when the element has no size yet or the stream size is unknown.
+            return TouchHelper.TryScaleToScreenSize(pos, Scrcpy.Width, Scrcpy.Height)
+                ? pos
+                : null;
         }
 
         private unsafe void OnFrame(object? sender, FrameData frameData)

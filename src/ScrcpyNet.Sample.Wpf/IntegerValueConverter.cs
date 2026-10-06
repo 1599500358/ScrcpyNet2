@@ -8,7 +8,8 @@ namespace ScrcpyNet.Sample.Wpf
     {
         public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
         {
-            return value.ToString()!;
+            // DoNothing while the binding still delivers null (e.g. no selection yet).
+            return value?.ToString() ?? Binding.DoNothing;
         }
 
         public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)

@@ -49,8 +49,11 @@ namespace ScrcpyNet.Test
             // A fixed port (e.g. the default 27183) collides with other local scrcpy
             // clients that may be running (the sample app binds one port per device), so
             // grab a free one instead.
-            var adc = new Scrcpy(device, GetFreePort());
-            adc.Start();
+            // using: also releases the decoder's FFmpeg contexts when the test ends.
+            using var adc = new Scrcpy(device, GetFreePort());
+            // Live hardware: the handshake takes ~4.5s warm and much longer when the
+            // phone wakes from idle/doze, hence a generous budget here.
+            adc.Start(30000);
         }
 
         private static int GetFreePort()
